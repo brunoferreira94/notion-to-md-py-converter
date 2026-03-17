@@ -1,0 +1,7 @@
+notion-to-md-py
+python-dotenv
+requests
+playwright
+markdownify
+beautifulsoup4
+html2text

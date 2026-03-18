@@ -49,7 +49,6 @@ python scripts\install_playwright.py --browsers chromium
 
 Há também a variável de ambiente PLAYWRIGHT_AUTO_INSTALL. Habilite-a quando quiser que o projeto tente instalar automaticamente os navegadores (por exemplo em ambientes de desenvolvimento ou CI controlados). Não habilite em ambientes restritos ou de produção sem garantir permissões e segurança, pois a instalação baixa binários externos.
 
-
 ## Configurar página pública
 
 1. Abra a página no Notion

@@ -267,11 +267,9 @@ def find_placeholders_in_html(html: str, use_regex: Optional[bool] = None) -> Tu
     for m in re.finditer(r'([a-zA-Z0-9_\-:]+)=["\']([^"\']*)["\']', html):
         attr = m.group(1).lower()
         val = m.group(2).lower()
-        if attr in ('aria-busy', 'data-loading') or any(k in attr for k in ['loading', 'busy', 'placeholder', 'skeleton', 'shimmer', 'unknown']):
-            sel = f'{m.group(1)}="{m.group(2)}"'
-            ctx = html[max(0, m.start() - 60) : m.end() + 60]
-            results.append({'selector_or_snippet': sel, 'match_type': 'attribute', 'context': ctx})
-        elif any(k in val for k in ['loading', 'shimmer', 'placeholder', 'skeleton', 'unknown']):
+        is_loading_attr = attr in ('aria-busy', 'data-loading') or any(k in attr for k in ['loading', 'busy', 'placeholder', 'skeleton', 'shimmer', 'unknown'])
+        is_loading_val = any(k in val for k in ['loading', 'shimmer', 'placeholder', 'skeleton', 'unknown'])
+        if is_loading_attr or is_loading_val:
             sel = f'{m.group(1)}="{m.group(2)}"'
             ctx = html[max(0, m.start() - 60) : m.end() + 60]
             results.append({'selector_or_snippet': sel, 'match_type': 'attribute', 'context': ctx})
@@ -308,14 +306,13 @@ def find_placeholders_in_html(html: str, use_regex: Optional[bool] = None) -> Tu
 
 def detect_placeholders_in_text(text: str) -> list[str]:
     """Compatibility wrapper for older API: returns list of matched strings."""
-    has, matches = find_placeholders_in_text(text)
-    # previous API returned a list of known strings; return matches (strings)
+    _, matches = find_placeholders_in_text(text)
     return matches
 
 
 def detect_placeholders_in_html(html: str) -> list[dict]:
     """Compatibility wrapper for older API: returns list of occurrence dicts."""
-    has, occ = find_placeholders_in_html(html)
+    _, occ = find_placeholders_in_html(html)
     return occ
 
 
@@ -336,7 +333,6 @@ def normalize_notion_code_blocks(html: str) -> str:
         if not text:
             return text
         use_regex = getattr(settings, 'PLACEHOLDER_USE_REGEX', True)
-        orig = text
         if use_regex:
             # Use compiled regex patterns first
             patterns = _ensure_compiled_patterns()
@@ -379,7 +375,7 @@ def normalize_notion_code_blocks(html: str) -> str:
             classes = el.get('class') or []
             if isinstance(classes, str):
                 classes = [classes]
-            clset = set([c.lower() for c in classes])
+            clset = {c.lower() for c in classes}
             if 'line-numbers' in clset and 'notion-code-block' in clset:
                 # skip if already contains pre/code
                 if el.find('pre') or el.find('code'):
@@ -396,7 +392,7 @@ def normalize_notion_code_blocks(html: str) -> str:
                     candidates.append(el)
 
         # Process each candidate
-        for el in list(candidates):
+        for el in candidates:
             # Replace <br> with newline text nodes to preserve line breaks
             for br in el.find_all('br'):
                 br.replace_with(NavigableString('\n'))
@@ -406,6 +402,8 @@ def normalize_notion_code_blocks(html: str) -> str:
             for node in el.descendants:
                 if isinstance(node, NavigableString):
                     parts.append(str(node))
+            # Detect if '=' appeared as a standalone token in its own span/text node
+            add_spaces_around_eq = any(p.strip() == '=' for p in parts)
             code_text = ''.join(parts)
 
             # Unescape HTML entities and normalize non-breaking spaces
@@ -414,24 +412,39 @@ def normalize_notion_code_blocks(html: str) -> str:
 
             # Remove placeholder substrings. If the block consists only of placeholders, make it empty.
             stripped = _strip_placeholders(code_text).strip()
-            if not stripped:
+            # Heuristic: if after removing known placeholders nothing remains, it's placeholder-only.
+            # Additionally treat common Notion loading phrases (e.g. "Carregando código de Plain Text...")
+            # as placeholder-only only when they include typical filler words.
+            lower = code_text.strip().lower()
+            is_loading_phrase = False
+            if lower.startswith(('carregando', 'loading')) and any(k in lower for k in ('plain', 'codigo', 'loading code')):
+                is_loading_phrase = True
+            if not stripped or is_loading_phrase:
                 final_text = ''
             else:
                 # Remove placeholders only (preserve surrounding text)
                 final_text = code_text
+                # Apply compiled regex patterns if configured
                 if getattr(settings, 'PLACEHOLDER_USE_REGEX', True):
                     pats = _ensure_compiled_patterns()
                     for p in pats:
-                        final_text = p.sub('', final_text)
-                else:
-                    for p in getattr(settings, 'PLACEHOLDER_PATTERNS', []):
                         try:
-                            final_text = _re.sub(_re.escape(p), '', final_text, flags=_re.I)
+                            final_text = p.sub('', final_text)
                         except Exception:
+                            pass
+                # Also remove simple placeholder substrings to catch boundary-less cases
+                for p in getattr(settings, 'PLACEHOLDER_PATTERNS', []):
+                    try:
+                        final_text = _re.sub(_re.escape(p), '', final_text, flags=_re.I)
+                    except Exception:
+                        try:
                             final_text = final_text.replace(p, '')
+                        except Exception:
+                            pass
 
             # Post-process small normalization (e.g. ensure spaces around '=' when tokens were split)
-            final_text = _re.sub(r"\s*=\s*", ' = ', final_text)
+            if add_spaces_around_eq:
+                final_text = _re.sub(r"\s*=\s*", ' = ', final_text)
 
             # Detect language from attributes or classes
             lang = None
@@ -497,21 +510,34 @@ def normalize_notion_code_blocks(html: str) -> str:
         text = text.replace('\u00A0', ' ').replace('\xa0', ' ').replace('\u00a0', ' ')
 
         stripped = _strip_placeholders(text).strip()
-        if not stripped:
+        lower = text.strip().lower()
+        is_loading_phrase = False
+        if lower.startswith(('carregando', 'loading')) and any(k in lower for k in ('plain', 'codigo', 'loading code')):
+            is_loading_phrase = True
+        if not stripped or is_loading_phrase:
             final_text = ''
         else:
             final_text = text
             if getattr(settings, 'PLACEHOLDER_USE_REGEX', True):
                 pats = _ensure_compiled_patterns()
                 for p in pats:
-                    final_text = p.sub('', final_text)
-            else:
-                for p in getattr(settings, 'PLACEHOLDER_PATTERNS', []):
                     try:
-                        final_text = _re.sub(_re.escape(p), '', final_text, flags=_re.I)
+                        final_text = p.sub('', final_text)
                     except Exception:
+                        pass
+            # remove simple substrings too to catch boundary-less cases
+            for p in getattr(settings, 'PLACEHOLDER_PATTERNS', []):
+                try:
+                    final_text = _re.sub(_re.escape(p), '', final_text, flags=_re.I)
+                except Exception:
+                    try:
                         final_text = final_text.replace(p, '')
-        final_text = _re.sub(r"\s*=\s*", ' = ', final_text)
+                    except Exception:
+                        pass
+        # For regex-fallback, detect if '=' was a standalone span/token in the original inner HTML
+        add_spaces_around_eq = bool(_re.search(r'<span[^>]*>\s*=\s*</span>', m.group(0), flags=_re.I))
+        if add_spaces_around_eq:
+            final_text = _re.sub(r"\s*=\s*", ' = ', final_text)
 
         # language detection from class_attr or attributes in the opening div
         lang = None

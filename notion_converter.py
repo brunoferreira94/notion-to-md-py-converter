@@ -110,11 +110,11 @@ def download_resource(url: str, assets_dir: Path, session=None) -> Optional[str]
 
 
 def process_html_assets(html: str, base_url: str, assets_dir: str) -> Tuple[str, List[str]]:
-    # If BS4 isn't available, skip HTML asset processing — preserve original behavior of returning no downloads.
     if not BS4_AVAILABLE:
         return html, []
+    assert BeautifulSoup is not None
     try:
-        soup = cast('bs4.BeautifulSoup', BeautifulSoup(html, settings.HTML_PARSER))
+        soup = BeautifulSoup(html, settings.HTML_PARSER)
     except Exception:
         return html, []
 
@@ -122,9 +122,16 @@ def process_html_assets(html: str, base_url: str, assets_dir: str) -> Tuple[str,
     session = __import__("requests").Session()
     downloaded = []
 
-    # Remove notion emoji images (extracted to helper to keep logic consistent)
     remove_notion_emojis(soup)
+    downloaded.extend(_process_images(soup, base_url, assets_path, session))
+    downloaded.extend(_process_backgrounds(soup, base_url, assets_path, session))
+    downloaded.extend(_process_links(soup, base_url, assets_path, session))
 
+    return str(soup), downloaded
+
+
+def _process_images(soup: Any, base_url: str, assets_path: Path, session: Any) -> List[str]:
+    downloaded = []
     for img in soup.find_all("img"):
         src = get_image_src(img)
         if not src:
@@ -135,11 +142,13 @@ def process_html_assets(html: str, base_url: str, assets_dir: str) -> Tuple[str,
             rel_url = rel_url_from_saved(saved, assets_path)
             img["src"] = rel_url
             downloaded.append(saved)
+    return downloaded
 
+
+def _process_backgrounds(soup: Any, base_url: str, assets_path: Path, session: Any) -> List[str]:
+    downloaded = []
     for el in soup.find_all(style=re.compile(r"background(-image)?:")):
         style = _attr_str(el.get("style"))
-        # Use a character class ['\"] instead of the alternation ("|') to satisfy SonarLint
-        # while keeping the same semantics: match an optional single or double quote.
         m = re.search(r"url(['\"])?(.*?)\1?\)", style)
         if m:
             src = m.group(2)
@@ -147,11 +156,14 @@ def process_html_assets(html: str, base_url: str, assets_dir: str) -> Tuple[str,
             saved = download_resource(src, assets_path, session)
             if saved:
                 rel_url = rel_url_from_saved(saved, assets_path)
-                # Same change in substitution: use character class for the optional quote
                 new_style = re.sub(r"url(['\"])?(.*?)\1?\)", f"url('{rel_url}')", style)
                 el["style"] = new_style
                 downloaded.append(saved)
+    return downloaded
 
+
+def _process_links(soup: Any, base_url: str, assets_path: Path, session: Any) -> List[str]:
+    downloaded = []
     for a in soup.find_all("a"):
         href = _attr_str(a.get("href"))
         if not href:
@@ -164,39 +176,45 @@ def process_html_assets(html: str, base_url: str, assets_dir: str) -> Tuple[str,
             rel_url = rel_url_from_saved(saved, assets_path)
             a["href"] = rel_url
             downloaded.append(saved)
-
-    return str(soup), downloaded
+    return downloaded
 
 
 def normalize_html_for_markdown(html: str) -> str:
-    # If BS4 isn't available, return original HTML unchanged.
     if not BS4_AVAILABLE:
         return html
+    assert BeautifulSoup is not None
     try:
-        soup = cast('bs4.BeautifulSoup', BeautifulSoup(html, settings.HTML_PARSER))
+        soup = BeautifulSoup(html, settings.HTML_PARSER)
     except Exception:
         return html
 
     root = soup.select_one("div.notion-page-content")
     if root is not None:
-        soup = cast('bs4.BeautifulSoup', BeautifulSoup(str(root), settings.HTML_PARSER))
+        soup = BeautifulSoup(str(root), settings.HTML_PARSER)
 
-    # BeautifulSoup.find_all returns a list-like ResultSet; calling list() was redundant.
-    for img in soup.find_all("img"): 
-        classes = img.get("class") or []
-        if isinstance(classes, str):
-            classes = [classes]
-        src = _attr_str(img.get("src")).strip()
-        is_data_gif_placeholder = src.startswith("data:image/gif")
-        is_notion_emoji_host = "notion-emojis" in src
-        if "notion-emoji" in classes or is_notion_emoji_host or is_data_gif_placeholder:
+    _process_notion_images(soup)
+    return str(soup)
+
+
+def _is_notion_emoji(img: Any) -> bool:
+    classes = img.get("class") or []
+    if isinstance(classes, str):
+        classes = [classes]
+    src = _attr_str(img.get("src")).strip()
+    is_data_gif_placeholder = src.startswith("data:image/gif")
+    is_notion_emoji_host = "notion-emojis" in src
+    return "notion-emoji" in classes or is_notion_emoji_host or is_data_gif_placeholder
+
+
+def _process_notion_images(soup: Any) -> None:
+    for img in soup.find_all("img"):
+        if _is_notion_emoji(img):
             alt = _attr_str(img.get("alt")).strip()
             first_token = alt.split(" ")[0].strip() if alt else ""
             if first_token and any(ord(ch) > 127 for ch in first_token):
                 img.replace_with(first_token)
             else:
                 img.decompose()
-    return str(soup)
 
 
 def html_to_markdown(html: str) -> str:
@@ -222,8 +240,9 @@ def extract_title_from_html(html: str) -> Optional[str]:
     # If BS4 isn't available, we cannot parse a title — return None to match prior fallback behavior.
     if not BS4_AVAILABLE:
         return None
+    assert BeautifulSoup is not None
     try:
-        soup = cast('bs4.BeautifulSoup', BeautifulSoup(html, settings.HTML_PARSER))
+        soup = BeautifulSoup(html, settings.HTML_PARSER)
     except Exception:
         return None
 
@@ -264,62 +283,58 @@ class NotionMarkdownConverter:
         )
 
     def _resolve_output_paths(self, title: str) -> Tuple[Path, Optional[Path], Optional[Path]]:
-        output_folder: Optional[Path] = None
-        if settings.EXPORT_BASE_DIR:
-            folder_name = sanitize_filename(title)[:160] if title else (extract_page_id(self.config.page_url) or "notion_page")
-            output_folder = ensure_dir(Path(settings.EXPORT_BASE_DIR) / folder_name)
-
-        if self.config.output:
-            out_name = self.config.output
-        else:
-            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-            safe = sanitize_filename(title)[:160] if title else ""
-            if safe:
-                out_name = f"{safe} - {ts}.md"
-            else:
-                pid = extract_page_id(self.config.page_url) or "notion_page"
-                out_name = f"{pid} - {ts}.md"
-
-        if output_folder and not Path(out_name).is_absolute():
-            out_path = output_folder / Path(out_name).name
-        else:
-            out_path = Path(out_name)
-
-        assets_dir: Optional[Path] = None
-        if self.config.download_assets:
-            if output_folder:
-                if self.config.assets_dir:
-                    # If assets_dir looks like a URL (has a non-file scheme), do not treat it as a local path.
-                    scheme = urlparse(self.config.assets_dir).scheme
-                    if scheme in ("", "file"):
-                        assets_dir = Path(self.config.assets_dir)
-                        if not assets_dir.is_absolute():
-                            assets_dir = output_folder / assets_dir
-                    else:
-                        # URL-like assets_dir (e.g., s3:// or https://) — avoid creating local Path
-                        assets_dir = None
-                else:
-                    assets_dir = output_folder / f"{out_path.stem}_assets"
-            else:
-                # No output_folder: only use config.assets_dir if it is a local path
-                if self.config.assets_dir and urlparse(self.config.assets_dir).scheme in ("", "file"):
-                    assets_dir = Path(self.config.assets_dir)
-                else:
-                    assets_dir = Path(f"{out_path.stem}_assets")
-
-        # Ensure assets_dir is calculated even when download_assets is False.
-        # Do not create the directory or change download behavior — only compute the Path.
-        if assets_dir is None:
-            # If user explicitly gave a URL-like assets_dir, keep it None to avoid creating local folders.
-            if getattr(self.config, 'assets_dir', None) and urlparse(getattr(self.config, 'assets_dir')).scheme not in ("", "file"):
-                pass
-            else:
-                if output_folder is not None:
-                    assets_dir = output_folder / f"{out_path.stem}_assets"
-                else:
-                    assets_dir = Path(f"{out_path.stem}_assets")
-
+        output_folder = self._get_output_folder(title)
+        out_name = self._get_output_name(title)
+        out_path = self._resolve_out_path(out_name, output_folder)
+        assets_dir = self._resolve_assets_dir(out_path, output_folder)
         return out_path, output_folder, assets_dir
+
+    def _get_output_folder(self, title: str) -> Optional[Path]:
+        if not settings.EXPORT_BASE_DIR:
+            return None
+        folder_name = sanitize_filename(title)[:160] if title else (extract_page_id(self.config.page_url) or "notion_page")
+        return ensure_dir(Path(settings.EXPORT_BASE_DIR) / folder_name)
+
+    def _get_output_name(self, title: str) -> str:
+        if self.config.output:
+            return self.config.output
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        safe = sanitize_filename(title)[:160] if title else ""
+        if safe:
+            return f"{safe} - {ts}.md"
+        pid = extract_page_id(self.config.page_url) or "notion_page"
+        return f"{pid} - {ts}.md"
+
+    def _resolve_out_path(self, out_name: str, output_folder: Optional[Path]) -> Path:
+        if output_folder and not Path(out_name).is_absolute():
+            return output_folder / Path(out_name).name
+        return Path(out_name)
+
+    def _resolve_assets_dir(self, out_path: Path, output_folder: Optional[Path]) -> Optional[Path]:
+        if self.config.download_assets:
+            return self._get_assets_dir_with_download(out_path, output_folder)
+        return self._get_assets_dir_fallback(out_path, output_folder)
+
+    def _get_assets_dir_with_download(self, out_path: Path, output_folder: Optional[Path]) -> Optional[Path]:
+        if not output_folder:
+            if self.config.assets_dir and urlparse(self.config.assets_dir).scheme in ("", "file"):
+                return Path(self.config.assets_dir)
+            return Path(f"{out_path.stem}_assets")
+        if not self.config.assets_dir:
+            return output_folder / f"{out_path.stem}_assets"
+        scheme = urlparse(self.config.assets_dir).scheme
+        if scheme in ("", "file"):
+            assets_dir = Path(self.config.assets_dir)
+            return output_folder / assets_dir if not assets_dir.is_absolute() else assets_dir
+        return None
+
+    def _get_assets_dir_fallback(self, out_path: Path, output_folder: Optional[Path]) -> Optional[Path]:
+        has_assets_dir = getattr(self.config, 'assets_dir', None)
+        if has_assets_dir and urlparse(has_assets_dir).scheme not in ("", "file"):
+            return None
+        if output_folder is not None:
+            return output_folder / f"{out_path.stem}_assets"
+        return Path(f"{out_path.stem}_assets")
 
     def _download_assets(self, html: str, base_url: str, assets_dir: Path) -> Tuple[str, List[str]]:
         ensure_dir(assets_dir)

@@ -95,3 +95,4 @@ output_assets/
 
 *.bak
 *.s6bak
+/pr_writer_notion_website/

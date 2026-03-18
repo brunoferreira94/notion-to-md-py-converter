@@ -26,6 +26,8 @@ from typing import Any, Iterable, List, Literal, Optional, Tuple, Union
 from dotenv import load_dotenv
 load_dotenv()
 
+_MSG_FALLBACK_REQUESTS = 'Fazendo fallback para fetch estático (requests).'
+
 # Diretório base para exportação (opcional) - usado para criar uma pasta por título dentro dele.
 # Exemplo em `.env`: NOTION_EXPORT_DIR=./out
 EXPORT_BASE_DIR = os.getenv('NOTION_EXPORT_DIR')
@@ -409,15 +411,15 @@ def render_with_playwright(
                             browser = p.chromium.launch(headless=not headful, args=['--disable-features=IsolateOrigins,site-per-process', '--disable-blink-features=AutomationControlled'])
                         except Exception as e2:
                             print('Falha ao reiniciar Playwright após instalação:', e2)
-                            print('Fazendo fallback para fetch estático (requests).')
+                            print(_MSG_FALLBACK_REQUESTS)
                             return fetch_html_requests(url)
                     else:
                         print('Instalação automática falhou.')
-                        print('Fazendo fallback para fetch estático (requests).')
+                        print(_MSG_FALLBACK_REQUESTS)
                         return fetch_html_requests(url)
                 else:
                     print('PLAYWRIGHT_AUTO_INSTALL está desabilitado.')
-                    print('Fazendo fallback para fetch estático (requests).')
+                    print(_MSG_FALLBACK_REQUESTS)
                     return fetch_html_requests(url)
             # não é um erro reconhecido como ausência de navegadores -> propagar
             raise
@@ -484,7 +486,7 @@ def render_with_playwright(
 
         last_height = 0
         stable_rounds = 0
-        for step in range(max_scroll_steps):
+        for _ in range(max_scroll_steps):
             if expand_toggles:
                 try:
                     _click_expandables(page)
@@ -765,7 +767,7 @@ def process_html_assets(html: str, base_url: str, assets_dir: str) -> tuple[str,
 
     # Emojis/ícones do Notion (spritesheet/data URI, data-gif placeholder e `notion-emojis...`)
     # quebram em muitos viewers. Convertemos para texto usando o `alt`.
-    for img in list(soup.find_all('img')):
+    for img in soup.find_all('img'):
         classes = img.get('class') or []
         if isinstance(classes, str):
             classes = [classes]
@@ -806,7 +808,7 @@ def process_html_assets(html: str, base_url: str, assets_dir: str) -> tuple[str,
     # background images em inline style
     for el in soup.find_all(style=re.compile(r'background(-image)?:')):
         style = _attr_str(el.get('style'))
-        m = re.search(r'url\(("|\')?(.*?)\1?\)', style)
+        m = re.search(r"url([\"']?(.*?)[\"']?)", style)
         if m:
             src = m.group(2)
             src = urljoin(base_url, src)
@@ -816,7 +818,7 @@ def process_html_assets(html: str, base_url: str, assets_dir: str) -> tuple[str,
                 # substituir url(...) por caminho relativo
                 rel_posix = rel.replace('\\','/')
                 rel_url = quote(rel_posix, safe='/')
-                new_style = re.sub(r'url\(("|\')?(.*?)\1?\)', f"url('{rel_url}')", style)
+                new_style = re.sub(r"url([\"']?(.*?)[\"']?)", f"url('{rel_url}')", style)
                 el['style'] = new_style
                 downloaded.append(saved)
 
@@ -857,7 +859,7 @@ def normalize_html_for_markdown(html: str) -> str:
     if root is not None:
         soup = BeautifulSoup(str(root), settings.HTML_PARSER)
 
-    for img in list(soup.find_all('img')):
+    for img in soup.find_all('img'):
         classes = img.get('class') or []
         if isinstance(classes, str):
             classes = [classes]

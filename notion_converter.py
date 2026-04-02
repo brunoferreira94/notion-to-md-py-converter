@@ -24,8 +24,8 @@ from converter_config import ConverterConfig
 from page_renderer import PageRenderer
 from renderers import fetch_html_requests
 import settings
-from notion_utils import hydrate_dynamic_content, toggle_click_to_open_cycle
-from notion_converter_helpers import remove_notion_emojis, get_image_src, resolve_full_url, rel_url_from_saved, filter_sublinks
+from notion_utils import hydrate_dynamic_content, toggle_click_to_open_cycle, normalize_notion_blocks_to_html
+from notion_converter_helpers import remove_notion_emojis, get_image_src, resolve_full_url, rel_url_from_saved, filter_sublinks, extract_notion_page_links
 
 
 def sanitize_filename(s: str) -> str:
@@ -164,6 +164,9 @@ def _process_backgrounds(soup: Any, base_url: str, assets_path: Path, session: A
 
 def _process_links(soup: Any, base_url: str, assets_path: Path, session: Any) -> List[str]:
     downloaded = []
+    _notion_re = re.compile(
+        r'^https?://(?:(?:www\.)?notion\.so|[\w-]+\.notion\.site)/', re.IGNORECASE
+    )
     for a in soup.find_all("a"):
         href = _attr_str(a.get("href"))
         if not href:
@@ -171,12 +174,23 @@ def _process_links(soup: Any, base_url: str, assets_path: Path, session: Any) ->
         if href.startswith("#") or href.startswith("mailto:") or href.startswith("javascript:"):
             continue
         full = resolve_full_url(href, base_url)
+        if _notion_re.match(full):
+            continue  # Notion page links handled by --subpages-as-files
         saved = download_resource(full, assets_path, session)
         if saved:
             rel_url = rel_url_from_saved(saved, assets_path)
             a["href"] = rel_url
             downloaded.append(saved)
     return downloaded
+
+
+_CONTENT_SELECTORS = [
+    "div.notion-page-content",
+    "div.notion-collection-view-body",
+    "[class*='notion-collection-view']",
+    "main",
+    "article",
+]
 
 
 def normalize_html_for_markdown(html: str) -> str:
@@ -188,9 +202,23 @@ def normalize_html_for_markdown(html: str) -> str:
     except Exception:
         return html
 
-    root = soup.select_one("div.notion-page-content")
+    # Always strip non-content tags to prevent JS/CSS leaking into Markdown
+    for tag in soup.find_all(["script", "style", "noscript", "link", "meta"]):
+        tag.decompose()
+
+    # Try multiple selectors — Notion database views don't use notion-page-content
+    root = None
+    for selector in _CONTENT_SELECTORS:
+        root = soup.select_one(selector)
+        if root is not None:
+            break
+
     if root is not None:
         soup = BeautifulSoup(str(root), settings.HTML_PARSER)
+
+    # Convert Notion block divs to semantic HTML before markdownify
+    normalised = normalize_notion_blocks_to_html(str(soup))
+    soup = BeautifulSoup(normalised, settings.HTML_PARSER)
 
     _process_notion_images(soup)
     return str(soup)
@@ -343,6 +371,77 @@ class NotionMarkdownConverter:
         print("Arquivos baixados:", len(downloaded))
         return html, downloaded
 
+    def _download_linked_pages_as_files(
+        self,
+        html: str,
+        md: str,
+        out_path: Path,
+        output_folder: Optional[Path],
+    ) -> str:
+        """Converte cada página Notion linkada em um arquivo .md separado em subdiretório.
+
+        Para cada link para outra página Notion encontrado em *html*:
+        - Renderiza / faz download da página sub-documento
+        - Extrai o título da página
+        - Cria ``<output_dir>/<titulo_sanitizado>/<titulo_sanitizado>.md``
+        - Opcionalmente baixa os assets para ``<titulo_sanitizado>_assets/``
+        - Substitui a URL Notion no markdown parente pelo caminho relativo local
+
+        Apenas 1 nível (sem recursão). Falhas por link são logadas e seguem adiante.
+        """
+        sublinks = extract_notion_page_links(html, self.config.page_url, base_url=self.config.page_url)
+        print(f"Sub-documentos Notion encontrados: {len(sublinks)}")
+        if not sublinks:
+            return md
+
+        # pasta de saída: mesmo diretório do arquivo pai
+        base_dir = output_folder if output_folder else out_path.parent
+
+        for sub_url, _link_text in sublinks:
+            print(f"  → Convertendo sub-documento: {sub_url}")
+            try:
+                sub_html = self.renderer.render(
+                    sub_url,
+                    screenshot_path=None,
+                    extract_selectables=(not self.config.no_extract_selectables),
+                )
+            except Exception as e:
+                print(f"    Falha ao renderizar sub-documento {sub_url}: {e}")
+                continue
+
+            sub_title = extract_title_from_html(sub_html) or ""
+            if not sub_title:
+                sub_title = extract_page_id(sub_url) or "sub_document"
+            safe_title = sanitize_filename(sub_title)[:160] or "sub_document"
+
+            sub_folder = ensure_dir(base_dir / safe_title)
+            sub_md_path = sub_folder / f"{safe_title}.md"
+
+            sub_assets_dir: Optional[Path] = None
+            if self.config.download_assets:
+                sub_assets_dir = sub_folder / f"{safe_title}_assets"
+                ensure_dir(sub_assets_dir)
+                sub_html, downloaded = process_html_assets(sub_html, sub_url, str(sub_assets_dir))
+                print(f"    Assets do sub-documento baixados: {len(downloaded)}")
+
+            sub_html = normalize_html_for_markdown(sub_html)
+            sub_md = html_to_markdown(sub_html)
+
+            sub_md_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(sub_md_path, "w", encoding="utf-8") as fh:
+                fh.write(sub_md)
+            print(f"    Salvo: {sub_md_path}")
+
+            # Caminho relativo do md parente até o sub-arquivo (posix, com quote)
+            rel = sub_md_path.relative_to(out_path.parent)
+            rel_posix = str(rel).replace("\\", "/")
+            quoted_rel = quote(rel_posix, safe="/")
+
+            # Substituir a URL Notion pelo caminho local no markdown parente
+            md = md.replace(f"]({sub_url})", f"]({quoted_rel})")
+
+        return md
+
     def _append_subpages(self, html: str, md: str, assets_dir: Optional[Path]) -> str:
         print("Procurando subpáginas internas para anexar...")
         sublinks: List[str] = []
@@ -377,12 +476,13 @@ class NotionMarkdownConverter:
         return md
 
     def run(self) -> None:
-        html = self.renderer.render(
+        raw_html = self.renderer.render(
             self.config.page_url,
             screenshot_path=self.config.screenshot,
             extract_selectables=(not self.config.no_extract_selectables),
         )
-        title = extract_title_from_html(html) or ''
+        title = extract_title_from_html(raw_html) or ''
+        html = raw_html
 
         out_path, output_folder, assets_dir = self._resolve_output_paths(title)
 
@@ -402,6 +502,9 @@ class NotionMarkdownConverter:
 
         if self.config.follow_subpages:
             md = self._append_subpages(html, md, assets_dir)
+
+        if self.config.subpages_as_files:
+            md = self._download_linked_pages_as_files(raw_html, md, out_path, output_folder)
 
         print('Título detectado:', title)
         print('Escrevendo arquivo:', out_path)

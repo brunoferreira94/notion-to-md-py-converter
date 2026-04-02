@@ -316,6 +316,144 @@ def detect_placeholders_in_html(html: str) -> list[dict]:
     return occ
 
 
+def normalize_notion_blocks_to_html(html: str) -> str:
+    """Convert Notion-specific block divs to standard semantic HTML.
+
+    Runs BEFORE markdownify so that block-level formatting (headings,
+    paragraphs, lists, callouts, dividers, toggles) is preserved in the
+    Markdown output.  Block types handled:
+
+    * ``notion-text-block``           → ``<p>``
+    * ``notion-header-block``         → ``<h1>``
+    * ``notion-sub_header-block``     → ``<h2>``
+    * ``notion-sub_sub_header-block`` → ``<h3>``
+    * ``notion-callout-block``        → ``<blockquote>``
+    * ``notion-quote-block``          → ``<blockquote>``
+    * ``notion-divider-block``        → ``<hr>``
+    * ``notion-bulleted_list-block``  → ``<ul><li>``
+    * ``notion-numbered_list-block``  → ``<ol><li>``
+    * ``notion-toggle-block``         → ``<details><summary>``
+    """
+    try:
+        from bs4 import BeautifulSoup, NavigableString, Tag
+    except ImportError:
+        return html
+
+    soup = BeautifulSoup(html or "", "html.parser")
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _extract_leaf_children(block):
+        """Return children of the contenteditable leaf inside *block*."""
+        leaf = block.find(attrs={"data-content-editable-leaf": True})
+        if leaf:
+            return list(leaf.children)
+        return list(block.children)
+
+    def _copy_children_into(src_children, dest_tag):
+        for child in src_children:
+            if isinstance(child, Tag):
+                dest_tag.append(child.extract())
+            else:
+                dest_tag.append(NavigableString(str(child)))
+
+    # ------------------------------------------------------------------
+    # 1. Dividers → <hr>
+    # ------------------------------------------------------------------
+    for block in soup.find_all("div", class_=re.compile(r"\bnotion-divider-block\b")):
+        block.replace_with(soup.new_tag("hr"))
+
+    # ------------------------------------------------------------------
+    # 2. Heading blocks — find existing <h*> inside and promote it
+    # ------------------------------------------------------------------
+    _HEADING_MAP = {
+        "notion-header-block": "h1",
+        "notion-sub_header-block": "h2",
+        "notion-sub_sub_header-block": "h3",
+    }
+    for cls, tag_name in _HEADING_MAP.items():
+        for block in soup.find_all("div", class_=re.compile(r"\b" + re.escape(cls) + r"\b")):
+            existing = block.find(["h1", "h2", "h3", "h4"])
+            new_h = soup.new_tag(tag_name)
+            if existing:
+                _copy_children_into(list(existing.children), new_h)
+            else:
+                _copy_children_into(_extract_leaf_children(block), new_h)
+            block.replace_with(new_h)
+
+    # ------------------------------------------------------------------
+    # 3. Callout / Quote blocks → <blockquote>
+    # ------------------------------------------------------------------
+    for block in soup.find_all("div", class_=re.compile(r"\bnotion-(callout|quote)-block\b")):
+        new_bq = soup.new_tag("blockquote")
+        # Remove emoji icon if present (first img inside callout)
+        icon = block.find("img")
+        if icon:
+            icon.decompose()
+        _copy_children_into(_extract_leaf_children(block), new_bq)
+        block.replace_with(new_bq)
+
+    # ------------------------------------------------------------------
+    # 4. Toggle blocks → <details open><summary>title</summary>…</details>
+    # ------------------------------------------------------------------
+    for block in soup.find_all("div", class_=re.compile(r"\bnotion-toggle-block\b")):
+        new_details = soup.new_tag("details", open="")
+        new_summary = soup.new_tag("summary")
+
+        title_el = block.find(["h1", "h2", "h3", "h4"])
+        if not title_el:
+            title_el = block.find("button")
+        if title_el:
+            _copy_children_into(list(title_el.children), new_summary)
+            title_el.decompose()
+
+        new_details.append(new_summary)
+        for child in list(block.children):
+            if isinstance(child, Tag):
+                new_details.append(child.extract())
+        block.replace_with(new_details)
+
+    # ------------------------------------------------------------------
+    # 5. Text blocks → <p>
+    # ------------------------------------------------------------------
+    for block in soup.find_all("div", class_=re.compile(r"\bnotion-text-block\b")):
+        new_p = soup.new_tag("p")
+        _copy_children_into(_extract_leaf_children(block), new_p)
+        block.replace_with(new_p)
+
+    # ------------------------------------------------------------------
+    # 6. List blocks → <li> elements, then group into <ul>/<ol>
+    # ------------------------------------------------------------------
+    def _replace_list_blocks(block_class: str, list_tag: str) -> None:
+        for block in soup.find_all("div", class_=re.compile(r"\b" + re.escape(block_class) + r"\b")):
+            # Remove marker div (bullet/number graphic)
+            for marker in block.find_all(class_="notion-list-item-box-left"):
+                marker.decompose()
+            new_li = soup.new_tag("li")
+            _copy_children_into(_extract_leaf_children(block), new_li)
+            block.replace_with(new_li)
+
+        # Group consecutive <li> not already inside a list
+        for li in soup.find_all("li"):
+            if li.parent and li.parent.name in ("ul", "ol"):
+                continue
+            prev = li.previous_sibling
+            while prev and isinstance(prev, NavigableString) and not prev.strip():
+                prev = prev.previous_sibling
+            if prev and prev.name == list_tag:
+                prev.append(li.extract())
+            else:
+                new_list = soup.new_tag(list_tag)
+                li.replace_with(new_list)
+                new_list.append(li)
+
+    _replace_list_blocks("notion-bulleted_list-block", "ul")
+    _replace_list_blocks("notion-numbered_list-block", "ol")
+
+    return str(soup)
+
+
 def normalize_notion_code_blocks(html: str) -> str:
     """Normalize Notion code blocks that are split across multiple <span> elements into
     a single <pre><code> block. Uses BeautifulSoup if available, falling back to a

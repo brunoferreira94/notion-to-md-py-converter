@@ -2,7 +2,7 @@
 
 Contains small, behavior-preserving utilities used by the main converter.
 """
-from typing import List, Tuple, TYPE_CHECKING, cast, Any
+from typing import List, Tuple, TYPE_CHECKING, cast, Any, Dict
 import os
 from pathlib import Path
 from urllib.parse import urljoin, quote
@@ -86,3 +86,77 @@ def filter_sublinks(items: List[str], page_url: str) -> List[str]:
         seen.add(it)
         out.append(it)
     return out
+
+
+_NOTION_HOST_RE = re.compile(
+    r'^https?://(?:(?:www\.)?notion\.so|[\w-]+\.notion\.site)/',
+    re.IGNORECASE,
+)
+_PAGE_ID_RE = re.compile(r'[0-9a-f]{32}', re.IGNORECASE)
+
+
+def _notion_page_id(url: str) -> str:
+    """Extract the trailing 32-hex-char page ID from a Notion URL, or return ''."""
+    from urllib.parse import urlparse as _urlparse
+    path = _urlparse(url).path.rstrip("/")
+    parts = path.split("-")
+    if parts:
+        cand = parts[-1].replace("-", "")
+        if re.fullmatch(r'[0-9a-f]{32}', cand, re.IGNORECASE):
+            return cand.lower()
+    m = _PAGE_ID_RE.search(path)
+    return m.group(0).lower() if m else ""
+
+
+def extract_notion_page_links(
+    html: str,
+    exclude_url: str,
+    base_url: str = "",
+) -> List[Tuple[str, str]]:
+    """Extract hrefs pointing to other Notion pages found in *html*.
+
+    Returns a list of ``(href, link_text)`` pairs, deduplicated by page ID and
+    excluding any link that resolves to the same page as *exclude_url*.
+
+    Accepts full Notion URLs (``https://notion.so/...``,
+    ``https://<workspace>.notion.site/...``) as well as relative paths
+    (``/Page-Title-32hexid``) which are resolved against *base_url* when
+    provided.
+    """
+    if BeautifulSoup is None:
+        return []
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        return []
+
+    exclude_id = _notion_page_id(exclude_url)
+    seen: set = set()
+    results: List[Tuple[str, str]] = []
+
+    for a in soup.find_all("a", href=True):
+        raw = str(a.get("href") or "").strip()
+        if not raw:
+            continue
+
+        # Resolve relative paths against base_url when available
+        if base_url and not raw.startswith("http"):
+            from urllib.parse import urljoin as _urljoin
+            href = _urljoin(base_url, raw)
+        else:
+            href = raw
+
+        if not _NOTION_HOST_RE.match(href):
+            continue
+        link_id = _notion_page_id(href)
+        if not link_id:
+            continue
+        if exclude_id and link_id == exclude_id:
+            continue
+        if link_id in seen:
+            continue
+        seen.add(link_id)
+        text = a.get_text(strip=True) or href
+        results.append((href, text))
+
+    return results

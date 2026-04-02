@@ -18,3 +18,4 @@ class ConverterConfig:
     download_assets: bool = False
     assets_dir: Optional[str] = None
     follow_subpages: bool = False
+    subpages_as_files: bool = False

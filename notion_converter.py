@@ -320,18 +320,19 @@ class NotionMarkdownConverter:
     def _get_output_folder(self, title: str) -> Optional[Path]:
         if not settings.EXPORT_BASE_DIR:
             return None
-        folder_name = sanitize_filename(title)[:160] if title else (extract_page_id(self.config.page_url) or "notion_page")
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        base = sanitize_filename(title)[:160] if title else (extract_page_id(self.config.page_url) or "notion_page")
+        folder_name = f"{base} - {ts}"
         return ensure_dir(Path(settings.EXPORT_BASE_DIR) / folder_name)
 
     def _get_output_name(self, title: str) -> str:
         if self.config.output:
             return self.config.output
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         safe = sanitize_filename(title)[:160] if title else ""
         if safe:
-            return f"{safe} - {ts}.md"
+            return f"{safe}.md"
         pid = extract_page_id(self.config.page_url) or "notion_page"
-        return f"{pid} - {ts}.md"
+        return f"{pid}.md"
 
     def _resolve_out_path(self, out_name: str, output_folder: Optional[Path]) -> Path:
         if output_folder and not Path(out_name).is_absolute():

@@ -16,6 +16,15 @@ except Exception:
     BeautifulSoup = None  # type: ignore
 
 
+def _is_notion_emoji_img(img) -> bool:
+    """Return True if *img* is a Notion emoji placeholder image."""
+    classes = img.get("class") or []
+    if isinstance(classes, str):
+        classes = [classes]
+    src = str(img.get("src") or "")
+    return "notion-emoji" in classes or "notion-emojis" in src or src.startswith("data:image/gif")
+
+
 def remove_notion_emojis(soup: "bs4.BeautifulSoup | None") -> None:
     """Remove or replace Notion emoji img tags in a BeautifulSoup tree in-place."""
     if BeautifulSoup is None:
@@ -23,24 +32,14 @@ def remove_notion_emojis(soup: "bs4.BeautifulSoup | None") -> None:
     # Narrow type for the type-checker/runtime hints
     soup = cast('bs4.BeautifulSoup', soup)
     for img in soup.find_all("img"):
-        classes = img.get("class") or []
-        if isinstance(classes, str):
-            classes = [classes]
-        src = (img.get("src") or "")
-        src = str(src)
-        alt = (img.get("alt") or "")
-        alt = str(alt).strip()
-
-        is_data_gif_placeholder = src.startswith("data:image/gif")
-        is_notion_emoji_host = "notion-emojis" in src
-        is_notion_emoji_class = "notion-emoji" in classes
-
-        if is_notion_emoji_class or is_notion_emoji_host or is_data_gif_placeholder:
-            first_token = alt.split(" ")[0].strip() if alt else ""
-            if first_token and any(ord(ch) > 127 for ch in first_token):
-                img.replace_with(first_token)
-            else:
-                img.decompose()
+        if not _is_notion_emoji_img(img):
+            continue
+        alt = str(img.get("alt") or "").strip()
+        first_token = alt.split(" ")[0].strip() if alt else ""
+        if first_token and any(ord(ch) > 127 for ch in first_token):
+            img.replace_with(first_token)
+        else:
+            img.decompose()
 
 
 def get_image_src(img: "bs4.element.Tag | Any") -> str:
@@ -108,6 +107,31 @@ def _notion_page_id(url: str) -> str:
     return m.group(0).lower() if m else ""
 
 
+def _resolve_anchor_href(raw: str, base_url: str) -> str:
+    """Resolve a possibly-relative anchor href against *base_url*."""
+    if base_url and not raw.startswith("http"):
+        from urllib.parse import urljoin as _urljoin
+        return _urljoin(base_url, raw)
+    return raw
+
+
+def _extract_page_link_from_anchor(
+    a, base_url: str, exclude_id: str, seen: set
+) -> "Tuple[str, str] | None":
+    """Return (href, text) if *a* points to a new Notion page, else None."""
+    raw = str(a.get("href") or "").strip()
+    if not raw:
+        return None
+    href = _resolve_anchor_href(raw, base_url)
+    if not _NOTION_HOST_RE.match(href):
+        return None
+    link_id = _notion_page_id(href)
+    if not link_id or (exclude_id and link_id == exclude_id) or link_id in seen:
+        return None
+    seen.add(link_id)
+    return href, (a.get_text(strip=True) or href)
+
+
 def extract_notion_page_links(
     html: str,
     exclude_url: str,
@@ -135,28 +159,8 @@ def extract_notion_page_links(
     results: List[Tuple[str, str]] = []
 
     for a in soup.find_all("a", href=True):
-        raw = str(a.get("href") or "").strip()
-        if not raw:
-            continue
-
-        # Resolve relative paths against base_url when available
-        if base_url and not raw.startswith("http"):
-            from urllib.parse import urljoin as _urljoin
-            href = _urljoin(base_url, raw)
-        else:
-            href = raw
-
-        if not _NOTION_HOST_RE.match(href):
-            continue
-        link_id = _notion_page_id(href)
-        if not link_id:
-            continue
-        if exclude_id and link_id == exclude_id:
-            continue
-        if link_id in seen:
-            continue
-        seen.add(link_id)
-        text = a.get_text(strip=True) or href
-        results.append((href, text))
+        item = _extract_page_link_from_anchor(a, base_url, exclude_id, seen)
+        if item:
+            results.append(item)
 
     return results

@@ -274,6 +274,15 @@ def _toggle_click_to_open_cycle(page) -> int:
     except Exception:
         return 0
 
+def _scroll_to_phrase_occurrences(loc, count: int) -> None:
+    """Scroll to up to 20 occurrences of *loc* to trigger lazy loading."""
+    for i in range(min(count, 20)):
+        try:
+            loc.nth(i).scroll_into_view_if_needed(timeout=2000)
+        except Exception:
+            pass
+
+
 def _hydrate_text_placeholders(page, phrases: list[str], max_rounds: int = 10, wait_ms: int = 450) -> None:
     """Tenta forçar o carregamento de conteúdo lazy quando há placeholders de texto.
 
@@ -291,13 +300,7 @@ def _hydrate_text_placeholders(page, phrases: list[str], max_rounds: int = 10, w
             if not count:
                 continue
             total += count
-
-            # não iterar demais para evitar lentidão
-            for i in range(min(count, 20)):
-                try:
-                    loc.nth(i).scroll_into_view_if_needed(timeout=2000)
-                except Exception:
-                    pass
+            _scroll_to_phrase_occurrences(loc, count)
 
         if total == 0:
             return
@@ -306,6 +309,290 @@ def _hydrate_text_placeholders(page, phrases: list[str], max_rounds: int = 10, w
             page.wait_for_timeout(wait_ms)
         except Exception:
             return
+
+
+_PW_LAUNCH_ARGS = [
+    '--disable-features=IsolateOrigins,site-per-process',
+    '--disable-blink-features=AutomationControlled',
+]
+
+
+def _pw_is_browser_missing_err(msg: str) -> bool:
+    """Return True if *msg* indicates that Playwright browsers are not installed."""
+    if not msg:
+        return False
+    s = str(msg).lower()
+    keywords = [
+        "executable doesn't exist",
+        "executable does not exist",
+        "browsertype.launch",
+        "could not find",
+        "no executable",
+        "no browsers are installed",
+        "could not find any",
+        "is not installed",
+        "not installed",
+    ]
+    return any(k in s for k in keywords)
+
+
+def _pw_attempt_auto_install() -> bool:
+    """Attempt to auto-install Playwright browsers; return True on success."""
+    print('Tentativa de instalação automática dos navegadores Playwright iniciada...')
+    try:
+        script_path = Path(__file__).parent / 'scripts' / 'install_playwright.py'
+        if script_path.exists():
+            print(f'Executando utilitário local: {script_path}')
+            proc = subprocess.run([sys.executable, str(script_path)], capture_output=True, text=True)
+        else:
+            browsers = settings.PLAYWRIGHT_BROWSERS
+            browsers_list = browsers if isinstance(browsers, list) else [b.strip() for b in str(browsers).split(',') if b.strip()]
+            cmd = [sys.executable, '-m', 'playwright', 'install'] + browsers_list
+            print('Executando comando:', ' '.join(cmd))
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+        print('Instalação - stdout:\n', proc.stdout)
+        print('Instalação - stderr:\n', proc.stderr)
+        return proc.returncode == 0
+    except Exception as ie:
+        print('Erro ao executar instalador automático:', ie)
+        return False
+
+
+def _pw_try_launch_browser(p: Any, headful: bool) -> Any:
+    """Launch Playwright Chromium; return None when fallback to requests is needed."""
+    try:
+        return p.chromium.launch(headless=not headful, args=_PW_LAUNCH_ARGS)
+    except Exception as e:
+        msg = str(e)
+        if not _pw_is_browser_missing_err(msg):
+            raise
+        print('Erro ao iniciar Playwright:', msg)
+        print('\nParece que os navegadores Playwright não estão instalados.')
+        print('Por favor instale executando: python -m playwright install chromium')
+        print(r'Ou use o utilitário local: scripts\install_playwright.py')
+        if REQUIRE_PLAYWRIGHT:
+            print('\nPLAYWRIGHT_REQUIRE está habilitado: abortando.')
+            sys.exit(2)
+        if settings.PLAYWRIGHT_AUTO_INSTALL:
+            print('PLAYWRIGHT_AUTO_INSTALL está habilitado. Tentando instalação automática...')
+            ok = _pw_attempt_auto_install()
+            if ok:
+                print('Instalação automática concluída. Tentando iniciar o navegador novamente...')
+                try:
+                    return p.chromium.launch(headless=not headful, args=_PW_LAUNCH_ARGS)
+                except Exception as e2:
+                    print('Falha ao reiniciar Playwright após instalação:', e2)
+                    print(_MSG_FALLBACK_REQUESTS)
+                    return None
+            print('Instalação automática falhou.')
+            print(_MSG_FALLBACK_REQUESTS)
+            return None
+        print('PLAYWRIGHT_AUTO_INSTALL está desabilitado.')
+        print(_MSG_FALLBACK_REQUESTS)
+        return None
+
+
+def _pw_add_chunks_from_page(page: Any, extract_selectables: bool, chunks: "OrderedDict") -> None:
+    """Collect notion-selectable HTML blocks from *page* into *chunks*."""
+    try:
+        items = _extract_selectables(page) if extract_selectables else []
+        for it in items:
+            html = it.get('html') or ''
+            if not html:
+                continue
+            block_id = it.get('id')
+            key = f'id:{block_id}' if block_id else 'h:' + hashlib.sha1(html.encode('utf-8', errors='ignore')).hexdigest()
+            if key not in chunks:
+                chunks[key] = html
+    except Exception:
+        return
+
+
+def _pw_wait_for_content(page: Any, wait_selectors: list) -> bool:
+    """Try each selector; return True when one is found."""
+    for sel in wait_selectors:
+        try:
+            print(f'Esperando seletor: {sel} (timeout 20s)')
+            page.wait_for_selector(sel, timeout=20000)
+            print('Seletor encontrado:', sel)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _pw_goto_page(page: Any, url: str, wait_until: str, timeout: int) -> None:
+    """Navigate to *url*; print but do not re-raise on failure."""
+    try:
+        page.goto(url, wait_until=wait_until, timeout=timeout)
+    except Exception as e:
+        print('Playwright.goto error:', e)
+
+
+def _pw_pre_scroll_setup(page: Any, expand_toggles: bool) -> None:
+    """Reset scroll to top and do initial toggle expansion before the scroll loop."""
+    try:
+        page.evaluate('() => window.scrollTo(0, 0)')
+    except Exception:
+        pass
+    if expand_toggles:
+        try:
+            clicked = _click_expandables(page)
+            if clicked:
+                page.wait_for_timeout(200)
+        except Exception:
+            pass
+
+
+def _pw_click_expandables_safe(page: Any) -> None:
+    """Click expandable toggles, swallowing any exception."""
+    try:
+        _click_expandables(page)
+    except Exception:
+        pass
+
+
+def _pw_update_height_stability(h: int, last_height: int, stable_rounds: int) -> "tuple[int, int, bool]":
+    """Return (new_last_height, new_stable_rounds, should_stop) after a scroll step."""
+    if h == last_height:
+        new_stable = stable_rounds + 1
+        return last_height, new_stable, new_stable >= 8
+    return h, 0, False
+
+
+def _pw_scroll_collect(
+    page: Any,
+    max_scroll_steps: int,
+    scroll_wait_ms: int,
+    expand_toggles: bool,
+    extract_selectables: bool,
+    chunks: "OrderedDict",
+) -> None:
+    """Incrementally scroll *page*, collecting selectable blocks and forcing lazy-load."""
+    last_height = 0
+    stable_rounds = 0
+    for _ in range(max_scroll_steps):
+        if expand_toggles:
+            _pw_click_expandables_safe(page)
+        if extract_selectables:
+            _pw_add_chunks_from_page(page, extract_selectables, chunks)
+        try:
+            page.evaluate('() => window.scrollBy(0, Math.floor(window.innerHeight * 0.85))')
+        except Exception:
+            break
+        page.wait_for_timeout(scroll_wait_ms)
+        try:
+            h = page.evaluate('() => document.body.scrollHeight')
+        except Exception:
+            h = None
+        if h is not None:
+            last_height, stable_rounds, should_stop = _pw_update_height_stability(h, last_height, stable_rounds)
+            if should_stop:
+                break
+
+
+def _pw_post_scroll_hydration(page: Any, expand_toggles: bool, scroll_wait_ms: int) -> None:
+    """Scroll to bottom, expand toggles and hydrate lazy blocks after the scroll loop."""
+    try:
+        page.evaluate('() => window.scrollTo(0, document.body.scrollHeight)')
+        page.wait_for_timeout(400)
+    except Exception:
+        pass
+    if expand_toggles:
+        try:
+            _click_expandables(page)
+            page.wait_for_timeout(200)
+        except Exception:
+            pass
+        try:
+            _toggle_click_to_open_cycle(page)
+            page.wait_for_timeout(200)
+        except Exception:
+            pass
+    try:
+        _hydrate_dynamic_content(page, max_rounds=14, per_round_limit=80, wait_ms=max(200, int(scroll_wait_ms)))
+    except Exception:
+        pass
+    try:
+        _hydrate_text_placeholders(
+            page,
+            phrases=['Carregando código', 'Loading code'],
+            max_rounds=10,
+            wait_ms=max(300, int(scroll_wait_ms)),
+        )
+    except Exception:
+        pass
+
+
+def _pw_collect_content(page: Any, extract_selectables: bool, chunks: "OrderedDict") -> str:
+    """Return final HTML from selectable chunks when available, else full page.content()."""
+    _pw_add_chunks_from_page(page, extract_selectables, chunks)
+    if extract_selectables and chunks:
+        return '<div class="notion-export">\n' + '\n'.join(chunks.values()) + '\n</div>'
+    return page.content()
+
+
+def _pw_hydrate_retry(page: Any, content: str, max_retries: int) -> str:
+    """Run hydrate_cycle up to *max_retries* times; return updated content."""
+    for attempt in range(max_retries):
+        print(f'  Tentativa de hidratação {attempt+1}/{max_retries}')
+        try:
+            hydrate_cycle(page)
+        except Exception as e:
+            print('Erro durante hydrate_cycle():', e)
+        try:
+            page.wait_for_timeout(250)
+        except Exception:
+            pass
+        try:
+            content = page.content()
+        except Exception as e:
+            print('Erro ao obter conteúdo da página após hidratação:', e)
+            break
+        try:
+            placeholders = detect_placeholders_in_html(content)
+        except Exception:
+            placeholders = []
+        if not placeholders:
+            print('Placeholders removidos com sucesso.')
+            break
+    return content
+
+
+def _pw_process_placeholders_retry(page: Any, content: str) -> str:
+    """Detect placeholders, retry hydration, and warn or abort on persistent failures."""
+    try:
+        placeholders = detect_placeholders_in_html(content)
+    except Exception:
+        placeholders = []
+    if not placeholders:
+        return content
+    max_retries = getattr(settings, 'HYDRATION_MAX_RETRIES', 3)
+    print(f'Detectados placeholders no HTML. Iniciando até {max_retries} tentativas de hidratação...')
+    content = _pw_hydrate_retry(page, content, max_retries)
+    try:
+        placeholders = detect_placeholders_in_html(content)
+    except Exception:
+        placeholders = []
+    if placeholders:
+        if REQUIRE_PLAYWRIGHT:
+            print('\nNão foi possível hidratar todos os placeholders. Playwright é obrigatório neste modo.')
+            print('Por favor instale os navegadores: python -m playwright install chromium')
+            sys.exit(2)
+        else:
+            print('\nAviso: Ainda há placeholders após tentativas de hidratação. Continuando com o conteúdo atual.')
+    return content
+
+
+def _pw_save_debug(page: Any, content: str, screenshot_path: str) -> None:
+    """Save a debug screenshot (.png) and HTML file."""
+    try:
+        out_base = Path(screenshot_path)
+        out_base.parent.mkdir(parents=True, exist_ok=True)
+        page.screenshot(path=str(out_base.with_suffix('.png')), full_page=True)
+        out_base.with_suffix('.html').write_text(content, encoding='utf-8')
+    except Exception as e:
+        print('Falha ao salvar screenshot/html de diagnóstico:', e)
 
 
 def render_with_playwright(
@@ -330,7 +617,6 @@ def render_with_playwright(
         - Opcionalmente retorna apenas `notion-page-content > notion-selectable` (mais fiel e sem lixo de navegação)
     """
     if not PLAYWRIGHT_AVAILABLE:
-        # Se o usuário requisitou Playwright estrito, falhar imediatamente com instrução de instalação
         if REQUIRE_PLAYWRIGHT:
             print('\nParece que o Playwright não está instalado no ambiente.')
             print('Por favor instale os navegadores executando: python -m playwright install chromium')
@@ -349,271 +635,30 @@ def render_with_playwright(
         ]
 
     with sync_playwright() as p:
-        def _is_browser_missing_err(msg: str) -> bool:
-            if not msg:
-                return False
-            s = str(msg).lower()
-            keywords = [
-                "executable doesn't exist",
-                "executable does not exist",
-                "browsertype.launch",
-                "could not find",
-                "no executable",
-                "no browsers are installed",
-                "could not find any",
-                "is not installed",
-                "not installed",
-            ]
-            return any(k in s for k in keywords)
+        browser = _pw_try_launch_browser(p, headful)
+        if browser is None:
+            return fetch_html_requests(url)
 
-        def _attempt_auto_install() -> bool:
-            print('Tentativa de instalação automática dos navegadores Playwright iniciada...')
-            try:
-                script_path = Path(__file__).parent / 'scripts' / 'install_playwright.py'
-                if script_path.exists():
-                    print(f'Executando utilitário local: {script_path}')
-                    proc = subprocess.run([sys.executable, str(script_path)], capture_output=True, text=True)
-                else:
-                    browsers = settings.PLAYWRIGHT_BROWSERS
-                    if isinstance(browsers, list):
-                        browsers_list = browsers
-                    else:
-                        browsers_list = [b.strip() for b in str(browsers).split(',') if b.strip()]
-                    cmd = [sys.executable, '-m', 'playwright', 'install'] + browsers_list
-                    print('Executando comando:', ' '.join(cmd))
-                    proc = subprocess.run(cmd, capture_output=True, text=True)
-                print('Instalação - stdout:\n', proc.stdout)
-                print('Instalação - stderr:\n', proc.stderr)
-                return proc.returncode == 0
-            except Exception as ie:
-                print('Erro ao executar instalador automático:', ie)
-                return False
-
-        try:
-            browser = p.chromium.launch(headless=not headful, args=['--disable-features=IsolateOrigins,site-per-process', '--disable-blink-features=AutomationControlled'])
-        except Exception as e:
-            msg = str(e)
-            if _is_browser_missing_err(msg):
-                print('Erro ao iniciar Playwright:', msg)
-                print('\nParece que os navegadores Playwright não estão instalados.')
-                print('Por favor instale executando: python -m playwright install chromium')
-                print(r'Ou use o utilitário local: scripts\install_playwright.py')
-
-                # Se usuário requisitou Playwright obrigatório, não tentar auto-install nem fallback
-                if REQUIRE_PLAYWRIGHT:
-                    print('\nPLAYWRIGHT_REQUIRE está habilitado: abortando em vez de tentar instalação automática ou fallback.')
-                    sys.exit(2)
-
-                if settings.PLAYWRIGHT_AUTO_INSTALL:
-                    print('PLAYWRIGHT_AUTO_INSTALL está habilitado. Tentando instalação automática...')
-                    ok = _attempt_auto_install()
-                    if ok:
-                        print('Instalação automática concluída. Tentando iniciar o navegador novamente...')
-                        try:
-                            browser = p.chromium.launch(headless=not headful, args=['--disable-features=IsolateOrigins,site-per-process', '--disable-blink-features=AutomationControlled'])
-                        except Exception as e2:
-                            print('Falha ao reiniciar Playwright após instalação:', e2)
-                            print(_MSG_FALLBACK_REQUESTS)
-                            return fetch_html_requests(url)
-                    else:
-                        print('Instalação automática falhou.')
-                        print(_MSG_FALLBACK_REQUESTS)
-                        return fetch_html_requests(url)
-                else:
-                    print('PLAYWRIGHT_AUTO_INSTALL está desabilitado.')
-                    print(_MSG_FALLBACK_REQUESTS)
-                    return fetch_html_requests(url)
-            # não é um erro reconhecido como ausência de navegadores -> propagar
-            raise
-
-        context = browser.new_context(viewport={'width': 1280, 'height': 900})
         if user_agent:
             context = browser.new_context(viewport={'width': 1280, 'height': 900}, user_agent=user_agent)
+        else:
+            context = browser.new_context(viewport={'width': 1280, 'height': 900})
         page = context.new_page()
-        # headers
-        page.set_extra_http_headers({
-            'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7'
-        })
+        page.set_extra_http_headers({'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7'})
 
-        try:
-            page.goto(url, wait_until=wait_until, timeout=timeout)
-        except Exception as e:
-            # não falhar imediatamente; tentaremos capturar o que houver
-            print('Playwright.goto error:', e)
-
-        # tentar esperar por seletores conhecidos que indicam que o conteúdo foi renderizado
-        found = False
-        for sel in wait_selectors:
-            try:
-                print(f'Esperando seletor: {sel} (timeout 20s)')
-                page.wait_for_selector(sel, timeout=20000)
-                found = True
-                print('Seletor encontrado:', sel)
-                break
-            except Exception:
-                continue
-
-        # rolagem incremental para forçar carregamento de todas as seções
-        try:
-            page.evaluate('() => window.scrollTo(0, 0)')
-        except Exception:
-            pass
+        _pw_goto_page(page, url, wait_until, timeout)
+        found = _pw_wait_for_content(page, wait_selectors)
+        _pw_pre_scroll_setup(page, expand_toggles)
 
         chunks: "OrderedDict[str, str]" = OrderedDict()
+        _pw_scroll_collect(page, max_scroll_steps, scroll_wait_ms, expand_toggles, extract_selectables, chunks)
+        _pw_post_scroll_hydration(page, expand_toggles, scroll_wait_ms)
 
-        def add_chunks_from_page():
-            try:
-                items = _extract_selectables(page) if extract_selectables else []
-                for it in items:
-                    html = it.get('html') or ''
-                    if not html:
-                        continue
-                    block_id = it.get('id')
-                    if block_id:
-                        key = f'id:{block_id}'
-                    else:
-                        key = 'h:' + hashlib.sha1(html.encode('utf-8', errors='ignore')).hexdigest()
-                    if key not in chunks:
-                        chunks[key] = html
-            except Exception:
-                return
+        content = _pw_collect_content(page, extract_selectables, chunks)
+        content = _pw_process_placeholders_retry(page, content)
 
-        if expand_toggles:
-            try:
-                clicked = _click_expandables(page)
-                if clicked:
-                    page.wait_for_timeout(200)
-            except Exception:
-                pass
-
-        last_height = 0
-        stable_rounds = 0
-        for _ in range(max_scroll_steps):
-            if expand_toggles:
-                try:
-                    _click_expandables(page)
-                except Exception:
-                    pass
-
-            if extract_selectables:
-                add_chunks_from_page()
-
-            try:
-                page.evaluate('() => window.scrollBy(0, Math.floor(window.innerHeight * 0.85))')
-            except Exception:
-                break
-            page.wait_for_timeout(scroll_wait_ms)
-
-            try:
-                h = page.evaluate('() => document.body.scrollHeight')
-            except Exception:
-                h = None
-            if h is not None:
-                if h == last_height:
-                    stable_rounds += 1
-                else:
-                    stable_rounds = 0
-                    last_height = h
-                # se a altura parou de crescer por algumas iterações, provavelmente chegou no fim
-                if stable_rounds >= 8:
-                    break
-
-        # Garantir captura final no fim da página
-        try:
-            page.evaluate('() => window.scrollTo(0, document.body.scrollHeight)')
-            page.wait_for_timeout(400)
-        except Exception:
-            pass
-        if expand_toggles:
-            try:
-                _click_expandables(page)
-                page.wait_for_timeout(200)
-            except Exception:
-                pass
-
-        # Forçar hidratação de placeholders (unknown/shimmer), especialmente no fim da página
-        if expand_toggles:
-            try:
-                _toggle_click_to_open_cycle(page)
-                page.wait_for_timeout(200)
-            except Exception:
-                pass
-        try:
-            _hydrate_dynamic_content(page, max_rounds=14, per_round_limit=80, wait_ms=max(200, int(scroll_wait_ms)))
-        except Exception:
-            pass
-
-        # Alguns blocos (principalmente código) podem ficar como "Carregando ...".
-        # Forçar rolagem até esses placeholders para acionar IntersectionObservers.
-        try:
-            _hydrate_text_placeholders(
-                page,
-                phrases=[
-                    'Carregando código',
-                    'Loading code',
-                ],
-                max_rounds=10,
-                wait_ms=max(300, int(scroll_wait_ms)),
-            )
-        except Exception:
-            pass
-
-        if extract_selectables:
-            add_chunks_from_page()
-
-        if extract_selectables and chunks:
-            # Recriar um HTML mínimo só com o conteúdo selecionável
-            content = '<div class="notion-export">\n' + '\n'.join(chunks.values()) + '\n</div>'
-        else:
-            content = page.content()
-
-        # Detectar placeholders no HTML e tentar hidratar via hydrate_cycle em loop de retries
-        try:
-            placeholders = detect_placeholders_in_html(content)
-        except Exception:
-            placeholders = []
-        if placeholders:
-            max_retries = getattr(settings, 'HYDRATION_MAX_RETRIES', 3)
-            print(f'Detectados placeholders no HTML. Iniciando até {max_retries} tentativas de hidratação...')
-            for attempt in range(max_retries):
-                print(f'  Tentativa de hidratação {attempt+1}/{max_retries}')
-                try:
-                    hydrate_cycle(page)
-                except Exception as e:
-                    print('Erro durante hydrate_cycle():', e)
-                try:
-                    page.wait_for_timeout(250)
-                except Exception:
-                    pass
-                try:
-                    content = page.content()
-                except Exception as e:
-                    print('Erro ao obter conteúdo da página após hidratação:', e)
-                    break
-                try:
-                    placeholders = detect_placeholders_in_html(content)
-                except Exception:
-                    placeholders = []
-                if not placeholders:
-                    print('Placeholders removidos com sucesso.')
-                    break
-            if placeholders:
-                if REQUIRE_PLAYWRIGHT:
-                    print('\nNão foi possível hidratar todos os placeholders. Playwright é obrigatório neste modo.')
-                    print('Por favor instale os navegadores: python -m playwright install chromium')
-                    sys.exit(2)
-                else:
-                    print('\nAviso: Ainda há placeholders após tentativas de hidratação. Continuando com o conteúdo atual.')
-
-        # dumps opcionais para debug
         if screenshot_path:
-            try:
-                out_base = Path(screenshot_path)
-                out_base.parent.mkdir(parents=True, exist_ok=True)
-                page.screenshot(path=str(out_base.with_suffix('.png')), full_page=True)
-                out_base.with_suffix('.html').write_text(content, encoding='utf-8')
-            except Exception as e:
-                print('Falha ao salvar screenshot/html de diagnóstico:', e)
+            _pw_save_debug(page, content, screenshot_path)
 
         context.close()
         browser.close()
@@ -644,38 +689,44 @@ def _attr_str(val: Any) -> str:
     return str(val)
 
 
+def _extract_title_bs4(html: str) -> "str | None":
+    assert BeautifulSoup is not None
+    soup = BeautifulSoup(html, settings.HTML_PARSER)
+    title_tag = soup.find('title')
+    if title_tag and title_tag.text.strip():
+        return title_tag.text.strip()
+    for h in ['h1', 'h2', 'h3']:
+        htag = soup.find(h)
+        if htag and htag.text.strip():
+            return htag.text.strip()
+    og = soup.find('meta', property='og:title')
+    if og:
+        content = _attr_str(og.get('content')).strip()
+        if content:
+            return content
+    text = soup.get_text(separator='\n')
+    for line in text.splitlines():
+        s = line.strip()
+        if s:
+            return s
+    return None
+
+
+def _extract_title_regex(html: str) -> "str | None":
+    m = re.search(r'<title>(.*?)</title>', html, re.IGNORECASE | re.DOTALL)
+    if m:
+        return re.sub(r'\s+', ' ', m.group(1)).strip()
+    m = re.search(r'<h1[^>]*>(.*?)</h1>', html, re.IGNORECASE | re.DOTALL)
+    if m:
+        return re.sub(r'<[^>]+>', '', m.group(1)).strip()
+    return None
+
+
 def extract_title_from_html(html: str) -> str | None:
     # tenta <title>, depois primeiro heading h1/h2/h3, depois meta og:title
     if BS4_AVAILABLE:
-        assert BeautifulSoup is not None
-        soup = BeautifulSoup(html, settings.HTML_PARSER)
-        title_tag = soup.find('title')
-        if title_tag and title_tag.text.strip():
-            return title_tag.text.strip()
-        for h in ['h1', 'h2', 'h3']:
-            htag = soup.find(h)
-            if htag and htag.text.strip():
-                return htag.text.strip()
-        og = soup.find('meta', property='og:title')
-        if og:
-            content = _attr_str(og.get('content')).strip()
-            if content:
-                return content
-        # fallback: primeira linha de texto
-        text = soup.get_text(separator='\n')
-        for line in text.splitlines():
-            s = line.strip()
-            if s:
-                return s
-        return None
-    else:
-        m = re.search(r'<title>(.*?)</title>', html, re.IGNORECASE | re.DOTALL)
-        if m:
-            return re.sub(r'\s+', ' ', m.group(1)).strip()
-        m = re.search(r'<h1[^>]*>(.*?)</h1>', html, re.IGNORECASE | re.DOTALL)
-        if m:
-            return re.sub(r'<[^>]+>', '', m.group(1)).strip()
-        return None
+        return _extract_title_bs4(html)
+    return _extract_title_regex(html)
 
 
 def ensure_dir(path: Union[str, Path]):
@@ -756,6 +807,56 @@ def download_resource(url: str, assets_dir: Path, session: requests.Session | No
         return None
 
 
+def _process_img_downloads(soup, base_url: str, assets_path, session, downloaded: list) -> None:
+    """Download <img> sources and rewrite src to local relative paths."""
+    for img in soup.find_all('img'):
+        src = _attr_str(img.get('src') or img.get('data-src') or img.get('data-original-src'))
+        if not src:
+            srcset = _attr_str(img.get('srcset'))
+            if srcset:
+                src = srcset.split(',')[0].strip().split(' ')[0]
+        if not src:
+            continue
+        saved = download_resource(urljoin(base_url, src), assets_path, session)
+        if saved:
+            img['src'] = quote(os.path.relpath(saved, start=assets_path.parent).replace('\\', '/'), safe='/')
+            downloaded.append(saved)
+
+
+def _process_bg_images(soup, base_url: str, assets_path, session, downloaded: list) -> None:
+    """Download background-image URLs in inline styles and rewrite to local paths."""
+    for el in soup.find_all(style=re.compile(r'background(-image)?:')):
+        style = _attr_str(el.get('style'))
+        m = re.search(r'url\(["\']?([^"\')\s]+)["\']?\)', style)
+        if not m:
+            continue
+        saved = download_resource(urljoin(base_url, m.group(1)), assets_path, session)
+        if saved:
+            rel_url = quote(os.path.relpath(saved, start=assets_path.parent).replace('\\', '/'), safe='/')
+            el['style'] = re.sub(r'url\(["\']?[^"\')\s]+["\']?\)', f"url('{rel_url}')", style)
+            downloaded.append(saved)
+
+
+_ASSETS_NOTION_RE = re.compile(
+    r'^https?://(?:(?:www\.)?notion\.so|[\w-]+\.notion\.site)/', re.IGNORECASE
+)
+
+
+def _process_anchor_links(soup, base_url: str, assets_path, session, downloaded: list) -> None:
+    """Download linked file resources and rewrite href to local relative paths."""
+    for a in soup.find_all('a'):
+        href = _attr_str(a.get('href'))
+        if not href or href.startswith(('#', 'mailto:', 'javascript:')):
+            continue
+        full = urljoin(base_url, href)
+        if _ASSETS_NOTION_RE.match(full):
+            continue
+        saved = download_resource(full, assets_path, session)
+        if saved:
+            a['href'] = quote(os.path.relpath(saved, start=assets_path.parent).replace('\\', '/'), safe='/')
+            downloaded.append(saved)
+
+
 def process_html_assets(html: str, base_url: str, assets_dir: str) -> tuple[str, list]:
     """Baixa imagens e links de arquivo e reescreve HTML para apontar para arquivos locais.
     Retorna (html_modificado, lista_de_arquivos_baixados)
@@ -766,85 +867,12 @@ def process_html_assets(html: str, base_url: str, assets_dir: str) -> tuple[str,
     assets_path = ensure_dir(assets_dir)
     session = requests.Session()
     soup = BeautifulSoup(html, settings.HTML_PARSER)
-    downloaded = []
+    downloaded: list = []
 
-    # Emojis/ícones do Notion (spritesheet/data URI, data-gif placeholder e `notion-emojis...`)
-    # quebram em muitos viewers. Convertemos para texto usando o `alt`.
-    for img in soup.find_all('img'):
-        classes = img.get('class') or []
-        if isinstance(classes, str):
-            classes = [classes]
-        src = _attr_str(img.get('src')).strip()
-        alt = _attr_str(img.get('alt')).strip()
-
-        is_data_gif_placeholder = src.startswith('data:image/gif')
-        is_notion_emoji_host = 'notion-emojis' in src
-        is_notion_emoji_class = 'notion-emoji' in classes
-
-        if is_notion_emoji_class or is_notion_emoji_host or is_data_gif_placeholder:
-            first_token = alt.split(' ')[0].strip() if alt else ''
-            if first_token and any(ord(ch) > 127 for ch in first_token):
-                img.replace_with(first_token)
-            else:
-                img.decompose()
-
-    # imagens <img>
-    for img in soup.find_all('img'):
-        src = _attr_str(img.get('src') or img.get('data-src') or img.get('data-original-src'))
-        if not src:
-            # verificar srcset
-            srcset = _attr_str(img.get('srcset'))
-            if srcset:
-                # pegar o primeiro URL do srcset
-                src = srcset.split(',')[0].strip().split(' ')[0]
-        if not src:
-            continue
-        src = urljoin(base_url, src)
-        saved = download_resource(src, assets_path, session)
-        if saved:
-            # fazer link relativo
-            rel = os.path.relpath(saved, start=assets_path.parent)
-            rel_posix = rel.replace('\\','/')
-            img['src'] = quote(rel_posix, safe='/')
-            downloaded.append(saved)
-
-    # background images em inline style
-    for el in soup.find_all(style=re.compile(r'background(-image)?:')):
-        style = _attr_str(el.get('style'))
-        m = re.search(r"url([\"']?(.*?)[\"']?)", style)
-        if m:
-            src = m.group(2)
-            src = urljoin(base_url, src)
-            saved = download_resource(src, assets_path, session)
-            if saved:
-                rel = os.path.relpath(saved, start=assets_path.parent)
-                # substituir url(...) por caminho relativo
-                rel_posix = rel.replace('\\','/')
-                rel_url = quote(rel_posix, safe='/')
-                new_style = re.sub(r"url([\"']?(.*?)[\"']?)", f"url('{rel_url}')", style)
-                el['style'] = new_style
-                downloaded.append(saved)
-
-    # links para arquivos (possíveis attachments)
-    _notion_re = re.compile(
-        r'^https?://(?:(?:www\.)?notion\.so|[\w-]+\.notion\.site)/', re.IGNORECASE
-    )
-    for a in soup.find_all('a'):
-        href = _attr_str(a.get('href'))
-        if not href:
-            continue
-        if href.startswith('#') or href.startswith('mailto:') or href.startswith('javascript:'):
-            continue
-        # para links externos ou arquivos, baixar
-        full = urljoin(base_url, href)
-        if _notion_re.match(full):
-            continue  # Notion page links handled by --subpages-as-files
-        saved = download_resource(full, assets_path, session)
-        if saved:
-            rel = os.path.relpath(saved, start=assets_path.parent)
-            rel_posix = rel.replace('\\','/')
-            a['href'] = quote(rel_posix, safe='/')
-            downloaded.append(saved)
+    _strip_notion_emoji_imgs(soup)
+    _process_img_downloads(soup, base_url, assets_path, session, downloaded)
+    _process_bg_images(soup, base_url, assets_path, session, downloaded)
+    _process_anchor_links(soup, base_url, assets_path, session, downloaded)
 
     return str(soup), downloaded
 
@@ -856,6 +884,24 @@ _CONTENT_SELECTORS = [
     'main',
     'article',
 ]
+
+
+def _strip_notion_emoji_imgs(soup) -> None:
+    """Replace Notion emoji <img> tags with their alt text or remove them."""
+    for img in soup.find_all('img'):
+        classes = img.get('class') or []
+        if isinstance(classes, str):
+            classes = [classes]
+        src = _attr_str(img.get('src')).strip()
+        is_emoji = 'notion-emoji' in classes or 'notion-emojis' in src or src.startswith('data:image/gif')
+        if not is_emoji:
+            continue
+        alt = _attr_str(img.get('alt')).strip()
+        first_token = alt.split(' ')[0].strip() if alt else ''
+        if first_token and any(ord(ch) > 127 for ch in first_token):
+            img.replace_with(first_token)
+        else:
+            img.decompose()
 
 
 def normalize_html_for_markdown(html: str) -> str:
@@ -882,20 +928,7 @@ def normalize_html_for_markdown(html: str) -> str:
     normalised = normalize_notion_blocks_to_html(str(soup))
     soup = BeautifulSoup(normalised, settings.HTML_PARSER)
 
-    for img in soup.find_all('img'):
-        classes = img.get('class') or []
-        if isinstance(classes, str):
-            classes = [classes]
-        src = _attr_str(img.get('src')).strip()
-        is_data_gif_placeholder = src.startswith('data:image/gif')
-        is_notion_emoji_host = 'notion-emojis' in src
-        if 'notion-emoji' in classes or is_notion_emoji_host or is_data_gif_placeholder:
-            alt = _attr_str(img.get('alt')).strip()
-            first_token = alt.split(' ')[0].strip() if alt else ''
-            if first_token and any(ord(ch) > 127 for ch in first_token):
-                img.replace_with(first_token)
-            else:
-                img.decompose()
+    _strip_notion_emoji_imgs(soup)
 
     # Optionally normalize spanned Notion code blocks into <pre><code>
     if getattr(settings, 'NORMALIZE_NOTION_CODE_BLOCKS', True):
@@ -973,25 +1006,44 @@ class NotionMarkdownConverter:
             scroll_wait_ms=config.scroll_wait_ms,
         )
 
+    def _build_assets_dir(self, output_folder: Optional[Path], out_path: Path) -> Optional[Path]:
+        """Compute the local assets directory path, or None if not applicable."""
+        if not self.config.download_assets:
+            return None
+        if output_folder:
+            if self.config.assets_dir:
+                scheme = urlparse(self.config.assets_dir).scheme
+                if scheme not in ("", "file"):
+                    return None
+                assets_dir = Path(self.config.assets_dir)
+                if not assets_dir.is_absolute():
+                    assets_dir = output_folder / assets_dir
+                return assets_dir
+            return output_folder / f"{out_path.stem}_assets"
+        if self.config.assets_dir and urlparse(self.config.assets_dir).scheme in ("", "file"):
+            return Path(self.config.assets_dir)
+        return Path(f"{out_path.stem}_assets")
+
     def _resolve_output_paths(self, title: str) -> Tuple[Path, Optional[Path], Optional[Path]]:
         """Retorna (out_path, output_folder, assets_dir)."""
         # base de saída (pasta por título)
         output_folder: Optional[Path] = None
         if EXPORT_BASE_DIR:
-            folder_name = sanitize_filename(title)[:160] if title else (extract_page_id(self.config.page_url) or 'notion_page')
+            ts = datetime.now().strftime('%Y%m%d-%H%M%S')
+            base = sanitize_filename(title)[:160] if title else (extract_page_id(self.config.page_url) or 'notion_page')
+            folder_name = f"{base} - {ts}"
             output_folder = ensure_dir(Path(EXPORT_BASE_DIR) / folder_name)
 
         # nome do arquivo de saída
         if self.config.output:
             out_name = self.config.output
         else:
-            ts = datetime.now().strftime('%Y%m%d-%H%M%S')
             safe = sanitize_filename(title)[:160] if title else ''
             if safe:
-                out_name = f"{safe} - {ts}.md"
+                out_name = f"{safe}.md"
             else:
                 pid = extract_page_id(self.config.page_url) or 'notion_page'
-                out_name = f"{pid} - {ts}.md"
+                out_name = f"{pid}.md"
 
         # montar caminho final
         if output_folder and not Path(out_name).is_absolute():
@@ -999,29 +1051,7 @@ class NotionMarkdownConverter:
         else:
             out_path = Path(out_name)
 
-        # assets
-        assets_dir: Optional[Path] = None
-        if self.config.download_assets:
-            if output_folder:
-                if self.config.assets_dir:
-                    # If assets_dir looks like a URL (has a non-file scheme), do not treat it as a local path.
-                    scheme = urlparse(self.config.assets_dir).scheme
-                    if scheme in ("", "file"):
-                        assets_dir = Path(self.config.assets_dir)
-                        if not assets_dir.is_absolute():
-                            assets_dir = output_folder / assets_dir
-                    else:
-                        # URL-like assets_dir (e.g., s3:// or https://) — avoid creating local Path
-                        assets_dir = None
-                else:
-                    assets_dir = output_folder / f"{out_path.stem}_assets"
-            else:
-                # No output_folder: only use config.assets_dir if it is a local path
-                if self.config.assets_dir and urlparse(self.config.assets_dir).scheme in ("", "file"):
-                    assets_dir = Path(self.config.assets_dir)
-                else:
-                    assets_dir = Path(f"{out_path.stem}_assets")
-
+        assets_dir = self._build_assets_dir(output_folder, out_path)
         return out_path, output_folder, assets_dir
 
     def _render_html(self) -> str:
@@ -1121,6 +1151,23 @@ class NotionMarkdownConverter:
 
         return md
 
+    def _fetch_subpage_html(self, link: str, idx: int) -> str:
+        """Fetch HTML for a sub-page, using Playwright when available."""
+        if PLAYWRIGHT_AVAILABLE and not self.config.use_requests:
+            return render_with_playwright(
+                link,
+                user_agent=self.config.ua,
+                headful=self.config.headful,
+                wait_until='domcontentloaded',
+                timeout=60000,
+                screenshot_path=(self.config.screenshot + f'-sub{idx}' if self.config.screenshot else None),
+                expand_toggles=self.config.expand_toggles,
+                extract_selectables=(not self.config.no_extract_selectables),
+                max_scroll_steps=self.config.max_scroll_steps,
+                scroll_wait_ms=self.config.scroll_wait_ms,
+            )
+        return fetch_html_requests(link)
+
     def _append_subpages(self, html: str, md: str, assets_dir: Optional[Path]) -> str:
         print('Procurando subpáginas internas para anexar...')
         sublinks: List[str] = []
@@ -1135,21 +1182,7 @@ class NotionMarkdownConverter:
 
         for idx, link in enumerate(sublinks, start=1):
             try:
-                if PLAYWRIGHT_AVAILABLE and not self.config.use_requests:
-                    sub_html = render_with_playwright(
-                        link,
-                        user_agent=self.config.ua,
-                        headful=self.config.headful,
-                        wait_until='domcontentloaded',
-                        timeout=60000,
-                        screenshot_path=(self.config.screenshot + f'-sub{idx}' if self.config.screenshot else None),
-                        expand_toggles=self.config.expand_toggles,
-                        extract_selectables=(not self.config.no_extract_selectables),
-                        max_scroll_steps=self.config.max_scroll_steps,
-                        scroll_wait_ms=self.config.scroll_wait_ms,
-                    )
-                else:
-                    sub_html = fetch_html_requests(link)
+                sub_html = self._fetch_subpage_html(link, idx)
 
                 if self.config.download_assets and assets_dir is not None:
                     sub_assets_dir = assets_dir / f"subpage_{idx}"

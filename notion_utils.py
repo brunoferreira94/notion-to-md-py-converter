@@ -184,6 +184,45 @@ def toggle_click_to_open_cycle(page) -> int:
         return 0
 
 
+# ---------------------------------------------------------------------------
+# Placeholder detection helpers
+# ---------------------------------------------------------------------------
+
+def _find_regex_placeholder_matches(text: str) -> List[str]:
+    """Return all regex-pattern matches found in *text*."""
+    patterns = _ensure_compiled_patterns()
+    matches: List[str] = []
+    for pat in patterns:
+        for m in pat.finditer(text):
+            matches.append(m.group(0))
+    return matches
+
+
+def _find_literal_placeholder_matches(text: str) -> List[str]:
+    """Return all literal-pattern matches found in *text* (word-boundary aware)."""
+    matches: List[str] = []
+    for p in settings.PLACEHOLDER_PATTERNS:
+        try:
+            if re.search(r"\b" + re.escape(p) + r"\b", text, flags=re.I) or re.search(re.escape(p), text, flags=re.I):
+                matches.append(p)
+        except re.error:
+            if re.search(re.escape(p), text, flags=re.I):
+                matches.append(p)
+    return matches
+
+
+def _dedup_matches_preserve_order(matches: List[str]) -> List[str]:
+    """Deduplicate a list of match strings preserving insertion order (key = lower-case)."""
+    seen: set = set()
+    result: List[str] = []
+    for m in matches:
+        key = m.lower()
+        if key not in seen:
+            seen.add(key)
+            result.append(m)
+    return result
+
+
 def find_placeholders_in_text(text: str, use_regex: Optional[bool] = None) -> Tuple[bool, List[str]]:
     """Detect placeholders in a plain text string.
 
@@ -200,33 +239,69 @@ def find_placeholders_in_text(text: str, use_regex: Optional[bool] = None) -> Tu
     if use_regex is None:
         use_regex = settings.PLACEHOLDER_USE_REGEX
 
-    matches: List[str] = []
-    if use_regex:
-        patterns = _ensure_compiled_patterns()
-        for pat in patterns:
-            for m in pat.finditer(text):
-                matches.append(m.group(0))
-    else:
-        for p in settings.PLACEHOLDER_PATTERNS:
-            try:
-                # try word-boundary aware match and plain substring fallback
-                if re.search(r"\b" + re.escape(p) + r"\b", text, flags=re.I) or re.search(re.escape(p), text, flags=re.I):
-                    matches.append(p)
-            except re.error:
-                if re.search(re.escape(p), text, flags=re.I):
-                    matches.append(p)
-
-    # deduplicate preserving order
-    seen = set()
-    dedup: List[str] = []
-    for m in matches:
-        key = m.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        dedup.append(m)
-
+    raw = _find_regex_placeholder_matches(text) if use_regex else _find_literal_placeholder_matches(text)
+    dedup = _dedup_matches_preserve_order(raw)
     return (len(dedup) > 0, dedup)
+
+
+_HTML_LOADING_CLASS_KEYWORDS = ('shimmer', 'loading', 'loader', 'nds-shimmer', 'notion-unknown', 'placeholder', 'skeleton')
+_HTML_LOADING_ATTR_KEYWORDS = ('loading', 'busy', 'placeholder', 'skeleton', 'shimmer', 'unknown')
+
+
+def _find_class_based_placeholders(html: str) -> List[Dict]:
+    """Scan CSS classes in *html* for loading/shimmer/placeholder indicators."""
+    results: List[Dict] = []
+    for m in re.finditer(r'class=["\']([^"\']+)["\']', html, flags=re.I):
+        for cls in m.group(1).split():
+            cls_low = cls.lower()
+            if any(kw in cls_low for kw in _HTML_LOADING_CLASS_KEYWORDS):
+                ctx = html[max(0, m.start() - 60): m.end() + 60]
+                results.append({'selector_or_snippet': '.' + cls, 'match_type': 'class', 'context': ctx})
+    return results
+
+
+def _find_attr_based_placeholders(html: str) -> List[Dict]:
+    """Scan HTML attributes in *html* for loading-state indicators."""
+    results: List[Dict] = []
+    for m in re.finditer(r'([a-zA-Z0-9_\-:]+)=["\']([^"\']*)["\']', html):
+        attr = m.group(1).lower()
+        val = m.group(2).lower()
+        is_loading_attr = attr in ('aria-busy', 'data-loading') or any(k in attr for k in _HTML_LOADING_ATTR_KEYWORDS)
+        is_loading_val = any(k in val for k in _HTML_LOADING_ATTR_KEYWORDS)
+        if is_loading_attr or is_loading_val:
+            ctx = html[max(0, m.start() - 60): m.end() + 60]
+            results.append({'selector_or_snippet': f'{m.group(1)}="{m.group(2)}"', 'match_type': 'attribute', 'context': ctx})
+    return results
+
+
+def _find_text_placeholder_results(text_content: str, use_regex: bool) -> List[Dict]:
+    """Scan plain *text_content* for placeholder patterns; return result dicts."""
+    results: List[Dict] = []
+    if use_regex:
+        for pat in _ensure_compiled_patterns():
+            for m in pat.finditer(text_content):
+                idx = m.start()
+                snippet = text_content[max(0, idx - 60): idx + len(m.group(0)) + 60].strip()
+                results.append({'selector_or_snippet': m.group(0), 'match_type': 'regex', 'context': snippet})
+    else:
+        for k in settings.PLACEHOLDER_PATTERNS:
+            for match in re.finditer(re.escape(k), text_content, flags=re.I):
+                idx = match.start()
+                snippet = text_content[max(0, idx - 60): idx + len(k) + 60].strip()
+                results.append({'selector_or_snippet': k, 'match_type': 'text', 'context': snippet})
+    return results
+
+
+def _dedup_html_results(results: List[Dict]) -> List[Dict]:
+    """Deduplicate HTML placeholder results by (selector_or_snippet, match_type)."""
+    seen: set = set()
+    dedup: List[Dict] = []
+    for r in results:
+        key = (r.get('selector_or_snippet'), r.get('match_type'))
+        if key not in seen:
+            seen.add(key)
+            dedup.append(r)
+    return dedup
 
 
 def find_placeholders_in_html(html: str, use_regex: Optional[bool] = None) -> Tuple[bool, List[Dict]]:
@@ -243,8 +318,6 @@ def find_placeholders_in_html(html: str, use_regex: Optional[bool] = None) -> Tu
     if use_regex is None:
         use_regex = settings.PLACEHOLDER_USE_REGEX
 
-    results: List[Dict] = []
-
     # Remove/ignore content inside configured tags (script/style by default)
     text_html = html
     for tag in settings.PLACEHOLDER_DETECTION_IGNORE_TAGS:
@@ -253,54 +326,12 @@ def find_placeholders_in_html(html: str, use_regex: Optional[bool] = None) -> Tu
         # remove <tag ...>...</tag> (non-greedy)
         text_html = re.sub(fr"<({tag})\b[^>]*>.*?</\1>", ' ', text_html, flags=re.I | re.S)
 
-    # Detect class-based placeholders (heuristic)
-    for m in re.finditer(r'class=["\']([^"\']+)["\']', html, flags=re.I):
-        classes = m.group(1)
-        for cls in classes.split():
-            cls_low = cls.lower()
-            if any(keyword in cls_low for keyword in ['shimmer', 'loading', 'loader', 'nds-shimmer', 'notion-unknown', 'placeholder', 'skeleton']):
-                sel = '.' + cls
-                ctx = html[max(0, m.start() - 60) : m.end() + 60]
-                results.append({'selector_or_snippet': sel, 'match_type': 'class', 'context': ctx})
-
-    # Detect attributes that indicate loading state
-    for m in re.finditer(r'([a-zA-Z0-9_\-:]+)=["\']([^"\']*)["\']', html):
-        attr = m.group(1).lower()
-        val = m.group(2).lower()
-        is_loading_attr = attr in ('aria-busy', 'data-loading') or any(k in attr for k in ['loading', 'busy', 'placeholder', 'skeleton', 'shimmer', 'unknown'])
-        is_loading_val = any(k in val for k in ['loading', 'shimmer', 'placeholder', 'skeleton', 'unknown'])
-        if is_loading_attr or is_loading_val:
-            sel = f'{m.group(1)}="{m.group(2)}"'
-            ctx = html[max(0, m.start() - 60) : m.end() + 60]
-            results.append({'selector_or_snippet': sel, 'match_type': 'attribute', 'context': ctx})
-
-    # Extract text content (ignoring tags entirely) for text/regex scanning
+    results: List[Dict] = []
+    results.extend(_find_class_based_placeholders(html))
+    results.extend(_find_attr_based_placeholders(html))
     text_content = re.sub(r'<[^>]+>', ' ', text_html)
-
-    if use_regex:
-        patterns = _ensure_compiled_patterns()
-        for pat in patterns:
-            for m in pat.finditer(text_content):
-                idx = m.start()
-                snippet = text_content[max(0, idx - 60) : idx + len(m.group(0)) + 60].strip()
-                results.append({'selector_or_snippet': m.group(0), 'match_type': 'regex', 'context': snippet})
-    else:
-        for k in settings.PLACEHOLDER_PATTERNS:
-            for match in re.finditer(re.escape(k), text_content, flags=re.I):
-                idx = match.start()
-                snippet = text_content[max(0, idx - 60) : idx + len(k) + 60].strip()
-                results.append({'selector_or_snippet': k, 'match_type': 'text', 'context': snippet})
-
-    # Deduplicate by (selector_or_snippet, match_type)
-    seen = set()
-    dedup: List[Dict] = []
-    for r in results:
-        key = (r.get('selector_or_snippet'), r.get('match_type'))
-        if key in seen:
-            continue
-        seen.add(key)
-        dedup.append(r)
-
+    results.extend(_find_text_placeholder_results(text_content, use_regex))
+    dedup = _dedup_html_results(results)
     return (len(dedup) > 0, dedup)
 
 
@@ -314,6 +345,98 @@ def detect_placeholders_in_html(html: str) -> list[dict]:
     """Compatibility wrapper for older API: returns list of occurrence dicts."""
     _, occ = find_placeholders_in_html(html)
     return occ
+
+
+# ---------------------------------------------------------------------------
+# Block conversion helpers (used by normalize_notion_blocks_to_html)
+# ---------------------------------------------------------------------------
+
+def _extract_leaf_children(block) -> list:
+    """Return children of the contenteditable leaf inside *block*, or block's direct children."""
+    leaf = block.find(attrs={"data-content-editable-leaf": True})
+    if leaf:
+        return list(leaf.children)
+    return list(block.children)
+
+
+def _copy_children_into(src_children, dest_tag) -> None:
+    """Move/copy *src_children* nodes into *dest_tag*, handling both Tag and text nodes."""
+    from bs4 import Tag, NavigableString  # type: ignore[import]
+    for child in src_children:
+        if isinstance(child, Tag):
+            dest_tag.append(child.extract())
+        else:
+            dest_tag.append(NavigableString(str(child)))
+
+
+def _replace_notion_list_blocks(soup, block_class: str, list_tag: str) -> None:
+    """Convert Notion list-block divs to <li> elements and group them into <ul>/<ol>."""
+    from bs4 import Tag, NavigableString  # type: ignore[import]
+    for block in soup.find_all("div", class_=re.compile(r"\b" + re.escape(block_class) + r"\b")):
+        for marker in block.find_all(class_="notion-list-item-box-left"):
+            marker.decompose()
+        new_li = soup.new_tag("li")
+        _copy_children_into(_extract_leaf_children(block), new_li)
+        block.replace_with(new_li)
+
+    for li in soup.find_all("li"):
+        if li.parent and li.parent.name in ("ul", "ol"):
+            continue
+        prev = li.previous_sibling
+        while prev and isinstance(prev, NavigableString) and not prev.strip():
+            prev = prev.previous_sibling
+        if prev and isinstance(prev, Tag) and prev.name == list_tag:
+            prev.append(li.extract())
+        else:
+            new_list = soup.new_tag(list_tag)
+            li.replace_with(new_list)
+            new_list.append(li)
+
+
+def _replace_heading_blocks(soup) -> None:
+    """Replace Notion heading-block divs with semantic <h1>/<h2>/<h3>."""
+    _HEADING_MAP = {
+        "notion-header-block": "h1",
+        "notion-sub_header-block": "h2",
+        "notion-sub_sub_header-block": "h3",
+    }
+    for cls, tag_name in _HEADING_MAP.items():
+        for block in soup.find_all("div", class_=re.compile(r"\b" + re.escape(cls) + r"\b")):
+            existing = block.find(["h1", "h2", "h3", "h4"])
+            new_h = soup.new_tag(tag_name)
+            if existing:
+                _copy_children_into(list(existing.children), new_h)
+            else:
+                _copy_children_into(_extract_leaf_children(block), new_h)
+            block.replace_with(new_h)
+
+
+def _replace_callout_blocks(soup) -> None:
+    """Replace Notion callout/quote-block divs with <blockquote>."""
+    for block in soup.find_all("div", class_=re.compile(r"\bnotion-(callout|quote)-block\b")):
+        new_bq = soup.new_tag("blockquote")
+        icon = block.find("img")
+        if icon:
+            icon.decompose()
+        _copy_children_into(_extract_leaf_children(block), new_bq)
+        block.replace_with(new_bq)
+
+
+def _replace_toggle_blocks(soup) -> None:
+    """Replace Notion toggle-block divs with <details open><summary>…</summary>…</details>."""
+    from bs4 import Tag  # type: ignore[import]
+    for block in soup.find_all("div", class_=re.compile(r"\bnotion-toggle-block\b")):
+        new_details = soup.new_tag("details", open="")
+        new_summary = soup.new_tag("summary")
+        title_el = block.find(["h1", "h2", "h3", "h4"]) or block.find("button")
+        if title_el:
+            _copy_children_into(list(title_el.children), new_summary)
+            title_el.decompose()
+        new_details.append(new_summary)
+        for child in [*block.children]:
+            if isinstance(child, Tag):
+                new_details.append(child.extract())
+        block.replace_with(new_details)
 
 
 def normalize_notion_blocks_to_html(html: str) -> str:
@@ -335,123 +458,197 @@ def normalize_notion_blocks_to_html(html: str) -> str:
     * ``notion-toggle-block``         → ``<details><summary>``
     """
     try:
-        from bs4 import BeautifulSoup, NavigableString, Tag
+        from bs4 import BeautifulSoup
     except ImportError:
         return html
 
     soup = BeautifulSoup(html or "", "html.parser")
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-    def _extract_leaf_children(block):
-        """Return children of the contenteditable leaf inside *block*."""
-        leaf = block.find(attrs={"data-content-editable-leaf": True})
-        if leaf:
-            return list(leaf.children)
-        return list(block.children)
-
-    def _copy_children_into(src_children, dest_tag):
-        for child in src_children:
-            if isinstance(child, Tag):
-                dest_tag.append(child.extract())
-            else:
-                dest_tag.append(NavigableString(str(child)))
-
-    # ------------------------------------------------------------------
     # 1. Dividers → <hr>
-    # ------------------------------------------------------------------
     for block in soup.find_all("div", class_=re.compile(r"\bnotion-divider-block\b")):
         block.replace_with(soup.new_tag("hr"))
 
-    # ------------------------------------------------------------------
     # 2. Heading blocks — find existing <h*> inside and promote it
-    # ------------------------------------------------------------------
-    _HEADING_MAP = {
-        "notion-header-block": "h1",
-        "notion-sub_header-block": "h2",
-        "notion-sub_sub_header-block": "h3",
-    }
-    for cls, tag_name in _HEADING_MAP.items():
-        for block in soup.find_all("div", class_=re.compile(r"\b" + re.escape(cls) + r"\b")):
-            existing = block.find(["h1", "h2", "h3", "h4"])
-            new_h = soup.new_tag(tag_name)
-            if existing:
-                _copy_children_into(list(existing.children), new_h)
-            else:
-                _copy_children_into(_extract_leaf_children(block), new_h)
-            block.replace_with(new_h)
+    _replace_heading_blocks(soup)
 
-    # ------------------------------------------------------------------
     # 3. Callout / Quote blocks → <blockquote>
-    # ------------------------------------------------------------------
-    for block in soup.find_all("div", class_=re.compile(r"\bnotion-(callout|quote)-block\b")):
-        new_bq = soup.new_tag("blockquote")
-        # Remove emoji icon if present (first img inside callout)
-        icon = block.find("img")
-        if icon:
-            icon.decompose()
-        _copy_children_into(_extract_leaf_children(block), new_bq)
-        block.replace_with(new_bq)
+    _replace_callout_blocks(soup)
 
-    # ------------------------------------------------------------------
     # 4. Toggle blocks → <details open><summary>title</summary>…</details>
-    # ------------------------------------------------------------------
-    for block in soup.find_all("div", class_=re.compile(r"\bnotion-toggle-block\b")):
-        new_details = soup.new_tag("details", open="")
-        new_summary = soup.new_tag("summary")
+    _replace_toggle_blocks(soup)
 
-        title_el = block.find(["h1", "h2", "h3", "h4"])
-        if not title_el:
-            title_el = block.find("button")
-        if title_el:
-            _copy_children_into(list(title_el.children), new_summary)
-            title_el.decompose()
-
-        new_details.append(new_summary)
-        for child in list(block.children):
-            if isinstance(child, Tag):
-                new_details.append(child.extract())
-        block.replace_with(new_details)
-
-    # ------------------------------------------------------------------
     # 5. Text blocks → <p>
-    # ------------------------------------------------------------------
     for block in soup.find_all("div", class_=re.compile(r"\bnotion-text-block\b")):
         new_p = soup.new_tag("p")
         _copy_children_into(_extract_leaf_children(block), new_p)
         block.replace_with(new_p)
 
-    # ------------------------------------------------------------------
-    # 6. List blocks → <li> elements, then group into <ul>/<ol>
-    # ------------------------------------------------------------------
-    def _replace_list_blocks(block_class: str, list_tag: str) -> None:
-        for block in soup.find_all("div", class_=re.compile(r"\b" + re.escape(block_class) + r"\b")):
-            # Remove marker div (bullet/number graphic)
-            for marker in block.find_all(class_="notion-list-item-box-left"):
-                marker.decompose()
-            new_li = soup.new_tag("li")
-            _copy_children_into(_extract_leaf_children(block), new_li)
-            block.replace_with(new_li)
-
-        # Group consecutive <li> not already inside a list
-        for li in soup.find_all("li"):
-            if li.parent and li.parent.name in ("ul", "ol"):
-                continue
-            prev = li.previous_sibling
-            while prev and isinstance(prev, NavigableString) and not prev.strip():
-                prev = prev.previous_sibling
-            if prev and prev.name == list_tag:
-                prev.append(li.extract())
-            else:
-                new_list = soup.new_tag(list_tag)
-                li.replace_with(new_list)
-                new_list.append(li)
-
-    _replace_list_blocks("notion-bulleted_list-block", "ul")
-    _replace_list_blocks("notion-numbered_list-block", "ol")
+    # 6. List blocks → <ul>/<ol>
+    _replace_notion_list_blocks(soup, "notion-bulleted_list-block", "ul")
+    _replace_notion_list_blocks(soup, "notion-numbered_list-block", "ol")
 
     return str(soup)
+
+
+# ---------------------------------------------------------------------------
+# Code block normalization helpers (used by normalize_notion_code_blocks)
+# ---------------------------------------------------------------------------
+
+def _apply_compiled_pattern_removals(text: str) -> str:
+    """Apply all compiled regex patterns to remove placeholder matches from *text*."""
+    for pat in _ensure_compiled_patterns():
+        try:
+            text = pat.sub('', text)
+        except Exception:
+            pass
+    return text
+
+
+def _apply_literal_pattern_removals(text: str) -> str:
+    """Apply all literal PLACEHOLDER_PATTERNS to remove occurrences from *text*."""
+    for p in getattr(settings, 'PLACEHOLDER_PATTERNS', []):
+        try:
+            text = re.sub(re.escape(p), '', text, flags=re.I)
+        except Exception:
+            try:
+                text = text.replace(p, '')
+            except Exception:
+                pass
+    return text
+
+
+def _strip_code_placeholder_text(text: str) -> str:
+    """Remove configured placeholder patterns from *text* and normalize non-breaking spaces."""
+    if not text:
+        return text
+    if getattr(settings, 'PLACEHOLDER_USE_REGEX', True):
+        text = _apply_compiled_pattern_removals(text)
+    text = _apply_literal_pattern_removals(text)
+    return text.replace('\u00A0', ' ').replace('\xa0', ' ')
+
+
+def _code_is_loading_phrase(text: str) -> bool:
+    """Return True if *text* is a Notion loading-placeholder phrase (not real code)."""
+    lower = text.strip().lower()
+    return lower.startswith(('carregando', 'loading')) and any(
+        k in lower for k in ('plain', 'codigo', 'loading code')
+    )
+
+
+def _apply_code_text_cleanup(raw_text: str) -> str:
+    """Unescape HTML, normalize spaces and strip placeholders from code block text.
+
+    Returns empty string when the block is entirely placeholder-only or a loading phrase.
+    """
+    import html as _html  # stdlib alias — 'html' parameter in callers would shadow the module
+    code_text = _html.unescape(raw_text)
+    code_text = code_text.replace('\u00A0', ' ').replace('\xa0', ' ').replace('\u00a0', ' ')
+    stripped = _strip_code_placeholder_text(code_text).strip()
+    if not stripped or _code_is_loading_phrase(code_text):
+        return ''
+    final = code_text
+    if getattr(settings, 'PLACEHOLDER_USE_REGEX', True):
+        final = _apply_compiled_pattern_removals(final)
+    final = _apply_literal_pattern_removals(final)
+    return final
+
+
+def _detect_code_lang_bs4(el) -> Optional[str]:
+    """Detect code language from a BeautifulSoup element's attributes and classes."""
+    for key in ('data-language', 'data-lang', 'data-block-language'):
+        v = el.get(key)
+        if v:
+            return str(v).strip()
+    for c in (el.get('class') or []):
+        if not c:
+            continue
+        m = re.match(r'(?:language|lang)[-_](.+)', str(c), flags=re.I)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _detect_code_lang_str(tag_opening: str, class_attr: str) -> Optional[str]:
+    """Detect code language from the opening HTML tag string and class attribute."""
+    mlang = re.search(r'data-(?:language|lang|block-language)=["\']([^"\']+)["\']', tag_opening, flags=re.I)
+    if mlang:
+        return mlang.group(1)
+    mcls = re.search(r'(?:language|lang)[-_](\w+)', class_attr, flags=re.I)
+    return mcls.group(1) if mcls else None
+
+
+def _code_div_has_candidate_classes(class_attr: str) -> bool:
+    """Return True if the div class attribute marks it as a Notion code block candidate."""
+    if not class_attr:
+        return False
+    cl = class_attr.lower()
+    return 'line-numbers' in cl or 'notion-code-block' in cl
+
+
+def _find_bs4_code_candidates(soup) -> list:
+    """Find BS4 elements that look like Notion code blocks needing normalization."""
+    def _no_code(el) -> bool:
+        return not el.find('pre') and not el.find('code')
+
+    def _clset(el) -> set:
+        classes = el.get('class') or []
+        if isinstance(classes, str):
+            classes = [classes]
+        return {c.lower() for c in classes}
+
+    candidates = [
+        el for el in soup.find_all(True)
+        if _no_code(el) and {'line-numbers', 'notion-code-block'} <= _clset(el)
+    ]
+    if not candidates:
+        candidates = [
+            el for el in soup.find_all(True)
+            if _no_code(el) and len(el.find_all('span')) >= 4
+        ]
+    return candidates
+
+
+def _process_bs4_code_candidate(soup, el) -> None:
+    """Replace a BS4 element with a normalised <pre><code> block, in-place."""
+    from bs4 import NavigableString  # type: ignore[import]
+    for br in el.find_all('br'):
+        br.replace_with(NavigableString('\n'))
+    parts = [str(node) for node in el.descendants if isinstance(node, NavigableString)]
+    add_eq_spaces = any(p.strip() == '=' for p in parts)
+    final_text = _apply_code_text_cleanup(''.join(parts))
+    if add_eq_spaces:
+        final_text = re.sub(r"\s*=\s*", ' = ', final_text)
+    lang = _detect_code_lang_bs4(el)
+    pre = soup.new_tag('pre')
+    code = soup.new_tag('code')
+    if lang:
+        code['class'] = [f'language-{lang}']
+    code.append(NavigableString(final_text))
+    pre.append(code)
+    el.replace_with(pre)
+
+
+def _process_regex_code_match(m) -> Optional[tuple]:
+    """Process a regex-matched div candidate; return (original, replacement) or None."""
+    import html as _html
+    class_attr = m.group(1)
+    inner = m.group(2)
+    if not _code_div_has_candidate_classes(class_attr):
+        return None
+    if re.search(r'<\s*(?:pre|code)\b', inner, flags=re.I):
+        return None
+    text = re.sub(r'<br\s*/?>', '\n', inner, flags=re.I)
+    text = re.sub(r'<\s*(?:span|div|code|pre)[^>]*>', '', text)
+    text = re.sub(r'<\s*/\s*(?:span|div|code|pre)[^>]*>', '', text)
+    final_text = _apply_code_text_cleanup(text)
+    add_eq_spaces = bool(re.search(r'<span[^>]*>\s*=\s*</span>', m.group(0), flags=re.I))
+    if add_eq_spaces:
+        final_text = re.sub(r"\s*=\s*", ' = ', final_text)
+    lang = _detect_code_lang_str(m.group(0), class_attr)
+    code_class = f'language-{lang}' if lang else ''
+    class_attr_text = f' class="{code_class}"' if code_class else ''
+    replacement = f"<pre><code{class_attr_text}>{_html.escape(final_text)}</code></pre>"
+    return m.group(0), replacement
 
 
 def normalize_notion_code_blocks(html: str) -> str:
@@ -463,236 +660,21 @@ def normalize_notion_code_blocks(html: str) -> str:
     <code> elements. It also removes configured placeholder substrings and
     attempts to detect the language from element attributes or classes.
     """
-    import html as _html
-    import re as _re
-
-    # Helper to remove placeholders from text and detect if text was only placeholders
-    def _strip_placeholders(text: str) -> str:
-        if not text:
-            return text
-        use_regex = getattr(settings, 'PLACEHOLDER_USE_REGEX', True)
-        if use_regex:
-            # Use compiled regex patterns first
-            patterns = _ensure_compiled_patterns()
-            for pat in patterns:
-                try:
-                    text = pat.sub('', text)
-                except Exception:
-                    pass
-            # Also remove simple configured placeholder substrings (covers cases where regex uses word boundaries)
-            for p in getattr(settings, 'PLACEHOLDER_PATTERNS', []):
-                try:
-                    text = _re.sub(_re.escape(p), '', text, flags=_re.I)
-                except Exception:
-                    try:
-                        text = text.replace(p, '')
-                    except Exception:
-                        pass
-        else:
-            for p in getattr(settings, 'PLACEHOLDER_PATTERNS', []):
-                try:
-                    text = _re.sub(_re.escape(p), '', text, flags=_re.I)
-                except Exception:
-                    text = text.replace(p, '')
-        # normalize nbsp and non-breaking
-        text = text.replace('\u00A0', ' ').replace('\xa0', ' ')
-        # collapse nothing else
-        return text
-
     try:
-        # Try to use BeautifulSoup if available
-        from bs4 import BeautifulSoup, NavigableString
-
+        from bs4 import BeautifulSoup
         soup = BeautifulSoup(html or '', settings.HTML_PARSER)
-
-        # Candidate selection
-        candidates = []
-
-        # Primary: elements whose class contains both 'line-numbers' and 'notion-code-block'
-        for el in soup.find_all(True):
-            classes = el.get('class') or []
-            if isinstance(classes, str):
-                classes = [classes]
-            clset = {c.lower() for c in classes}
-            if 'line-numbers' in clset and 'notion-code-block' in clset:
-                # skip if already contains pre/code
-                if el.find('pre') or el.find('code'):
-                    continue
-                candidates.append(el)
-
-        # Fallback: elements with >=4 <span> descendants and no existing <pre> or <code>
-        if not candidates:
-            for el in soup.find_all(True):
-                if el.find('pre') or el.find('code'):
-                    continue
-                spans = el.find_all('span')
-                if len(spans) >= 4:
-                    candidates.append(el)
-
-        # Process each candidate
-        for el in candidates:
-            # Replace <br> with newline text nodes to preserve line breaks
-            for br in el.find_all('br'):
-                br.replace_with(NavigableString('\n'))
-
-            # Collect text from descendant text nodes in DOM order
-            parts = []
-            for node in el.descendants:
-                if isinstance(node, NavigableString):
-                    parts.append(str(node))
-            # Detect if '=' appeared as a standalone token in its own span/text node
-            add_spaces_around_eq = any(p.strip() == '=' for p in parts)
-            code_text = ''.join(parts)
-
-            # Unescape HTML entities and normalize non-breaking spaces
-            code_text = _html.unescape(code_text)
-            code_text = code_text.replace('\u00A0', ' ').replace('\xa0', ' ').replace('\u00a0', ' ')
-
-            # Remove placeholder substrings. If the block consists only of placeholders, make it empty.
-            stripped = _strip_placeholders(code_text).strip()
-            # Heuristic: if after removing known placeholders nothing remains, it's placeholder-only.
-            # Additionally treat common Notion loading phrases (e.g. "Carregando código de Plain Text...")
-            # as placeholder-only only when they include typical filler words.
-            lower = code_text.strip().lower()
-            is_loading_phrase = False
-            if lower.startswith(('carregando', 'loading')) and any(k in lower for k in ('plain', 'codigo', 'loading code')):
-                is_loading_phrase = True
-            if not stripped or is_loading_phrase:
-                final_text = ''
-            else:
-                # Remove placeholders only (preserve surrounding text)
-                final_text = code_text
-                # Apply compiled regex patterns if configured
-                if getattr(settings, 'PLACEHOLDER_USE_REGEX', True):
-                    pats = _ensure_compiled_patterns()
-                    for p in pats:
-                        try:
-                            final_text = p.sub('', final_text)
-                        except Exception:
-                            pass
-                # Also remove simple placeholder substrings to catch boundary-less cases
-                for p in getattr(settings, 'PLACEHOLDER_PATTERNS', []):
-                    try:
-                        final_text = _re.sub(_re.escape(p), '', final_text, flags=_re.I)
-                    except Exception:
-                        try:
-                            final_text = final_text.replace(p, '')
-                        except Exception:
-                            pass
-
-            # Post-process small normalization (e.g. ensure spaces around '=' when tokens were split)
-            if add_spaces_around_eq:
-                final_text = _re.sub(r"\s*=\s*", ' = ', final_text)
-
-            # Detect language from attributes or classes
-            lang = None
-            # attributes
-            for key in ('data-language', 'data-lang', 'data-block-language'):
-                v = el.get(key)
-                if v:
-                    lang = str(v).strip()
-                    break
-            if not lang:
-                # classes like language-python or lang-python
-                for c in (el.get('class') or []):
-                    if not c:
-                        continue
-                    m = _re.match(r'(?:language|lang)[-_](.+)', str(c), flags=_re.I)
-                    if m:
-                        lang = m.group(1)
-                        break
-            code_class = f'language-{lang}' if lang else None
-
-            # Build new <pre><code>
-            pre = soup.new_tag('pre')
-            code = soup.new_tag('code')
-            if code_class:
-                code['class'] = [code_class]
-            # Use the final_text as a NavigableString so BeautifulSoup will escape it on output
-            code.append(NavigableString(final_text))
-            pre.append(code)
-
-            # Replace the original element with the new pre/code
-            el.replace_with(pre)
-
+        for el in _find_bs4_code_candidates(soup):
+            _process_bs4_code_candidate(soup, el)
         return str(soup)
-
     except Exception:
-        # bs4 not available or failed — fallback to regex
-        pass
+        pass  # bs4 not available or failed — use regex fallback
 
-    # Module-level compiled regex cache for fallback pattern
-    _candidate_div_re = _re.compile(r'<div[^>]*class=["\']([^"\']*)["\'][^>]*>(.*?)</div>', flags=_re.I | _re.S)
-
-    def _has_candidate_classes(class_attr: str) -> bool:
-        if not class_attr:
-            return False
-        cl = class_attr.lower()
-        return 'line-numbers' in cl or 'notion-code-block' in cl
-
-    out = html or ''
-    new_out = out
-    for m in _candidate_div_re.finditer(out):
-        class_attr = m.group(1)
-        inner = m.group(2)
-        if not _has_candidate_classes(class_attr):
-            continue
-        # skip if it already contains <pre> or <code>
-        if _re.search(r'<\s*(?:pre|code)\b', inner, flags=_re.I):
-            continue
-        # strip span/div tags but keep inner text
-        text = _re.sub(r'<br\s*/?>', '\n', inner, flags=_re.I)
-        text = _re.sub(r'<\s*(?:span|div|code|pre)[^>]*>', '', text)
-        text = _re.sub(r'<\s*/\s*(?:span|div|code|pre)[^>]*>', '', text)
-        text = _html.unescape(text)
-        text = text.replace('\u00A0', ' ').replace('\xa0', ' ').replace('\u00a0', ' ')
-
-        stripped = _strip_placeholders(text).strip()
-        lower = text.strip().lower()
-        is_loading_phrase = False
-        if lower.startswith(('carregando', 'loading')) and any(k in lower for k in ('plain', 'codigo', 'loading code')):
-            is_loading_phrase = True
-        if not stripped or is_loading_phrase:
-            final_text = ''
-        else:
-            final_text = text
-            if getattr(settings, 'PLACEHOLDER_USE_REGEX', True):
-                pats = _ensure_compiled_patterns()
-                for p in pats:
-                    try:
-                        final_text = p.sub('', final_text)
-                    except Exception:
-                        pass
-            # remove simple substrings too to catch boundary-less cases
-            for p in getattr(settings, 'PLACEHOLDER_PATTERNS', []):
-                try:
-                    final_text = _re.sub(_re.escape(p), '', final_text, flags=_re.I)
-                except Exception:
-                    try:
-                        final_text = final_text.replace(p, '')
-                    except Exception:
-                        pass
-        # For regex-fallback, detect if '=' was a standalone span/token in the original inner HTML
-        add_spaces_around_eq = bool(_re.search(r'<span[^>]*>\s*=\s*</span>', m.group(0), flags=_re.I))
-        if add_spaces_around_eq:
-            final_text = _re.sub(r"\s*=\s*", ' = ', final_text)
-
-        # language detection from class_attr or attributes in the opening div
-        lang = None
-        mlang = _re.search(r'data-(?:language|lang|block-language)=["\']([^"\']+)["\']', m.group(0), flags=_re.I)
-        if mlang:
-            lang = mlang.group(1)
-        else:
-            mcls = _re.search(r'(?:language|lang)[-_](\w+)', class_attr, flags=_re.I)
-            if mcls:
-                lang = mcls.group(1)
-        code_class = f'language-{lang}' if lang else ''
-
-        esc = _html.escape(final_text)
-        class_attr_text = f' class="{code_class}"' if code_class else ''
-        replacement = f"<pre><code{class_attr_text}>{esc}</code></pre>"
-
-        new_out = new_out.replace(m.group(0), replacement)
-
+    _candidate_div_re = re.compile(r'<div[^>]*class=["\']([^"\']*)["\'][^>]*>(.*?)</div>', flags=re.I | re.S)
+    new_out = html or ''
+    for m in _candidate_div_re.finditer(html or ''):
+        result = _process_regex_code_match(m)
+        if result:
+            orig, replacement = result
+            new_out = new_out.replace(orig, replacement)
     return new_out
 
